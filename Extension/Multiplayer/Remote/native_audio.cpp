@@ -52,7 +52,6 @@ struct State {
     // The local skater's updates as the game gave them, merged: sent whole when the surface sound goes.
     std::unique_ptr<NativeAudioFrame> as_given = std::make_unique<NativeAudioFrame>();
     std::atomic<std::uint32_t> surface_sound{}, surface_fields{~0U};
-    std::atomic<float> rolling_volume{1.0f}; // set_rolling_sound
     std::atomic<bool> surface_resend{}; // the whole state goes once (the surface sound changed)
     int surface_resend_in{};            // local updates until it goes whole (0: not waiting); under mutex
     unsigned surface_updates{};         // local updates with a surface sound, for its regular resend; under mutex
@@ -187,18 +186,6 @@ void submit_hook(Address handle, const NativeAudioFrame *frame) {
                 full = *s.as_given;
                 copy(&full, &given, masks.data());
                 send_full = true;
-            }
-            // The rolling sound turned down (set_rolling_sound): the game's own roll, scaled, in every update.
-            if (const float rolling = s.rolling_volume.load(std::memory_order_acquire); rolling < 1.0f) {
-                if (!send_full) {
-                    full = *s.accumulated;
-                    copy(&full, &snapshot, masks.data());
-                    if (sound_word) put_surface_sound(s, full, sound_word);
-                    send_full = true;
-                }
-                NativeAudioFrame game_now = *s.as_given;
-                copy(&game_now, &given, masks.data());
-                audio_put(full, 0xb4, audio_value<float>(game_now, 0xb4) * rolling);
             }
             if (send_full) {
                 for (const auto off : {0x164, 0x130, 0x124})
@@ -336,11 +323,6 @@ void set_surface_sound(std::uint32_t word, std::uint32_t fields) noexcept {
     s.surface_fields.store(fields, std::memory_order_release);
     s.surface_sound.store(word, std::memory_order_release);
     s.surface_resend.store(true, std::memory_order_release);
-}
-void set_rolling_sound(float volume) noexcept {
-    auto &s = state();
-    s.rolling_volume.store(std::clamp(volume, 0.0f, 1.0f), std::memory_order_release);
-    s.surface_resend.store(true, std::memory_order_release); // (back to the game's own: sent whole once)
 }
 std::vector<AudioSample> drain_audio_capture(std::uint64_t now) {
     auto &s = state();

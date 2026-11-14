@@ -73,19 +73,6 @@ struct WorldApi {
         }
         return result(L, game_of(plugin).skater_surface_sound(plugin.id(), word, fields));
     }
-    // rolling_sound(volume or nil): the local skater's rolling sound (its wheels' roll) as loud as the game has it
-    // times volume (0 to 1: 0 none); nil gives the game's own back.
-    static int rolling_sound(lua_State* L) {
-        auto& plugin = plugin_of(L);
-        need(L, plugin, "skater.control", "reskate.skater.rolling_sound");
-        std::optional<float> volume;
-        if (!lua_isnoneornil(L, 1)) {
-            const double value = luaL_checknumber(L, 1);
-            if (!(value >= 0 && value <= 1)) luaL_argerror(L, 1, "a volume is 0 to 1");
-            volume = static_cast<float>(value);
-        }
-        return result(L, game_of(plugin).skater_rolling_sound(plugin.id(), volume));
-    }
     static int control(lua_State* L, const char* action) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "skater.control", "reskate.skater control");
@@ -3633,7 +3620,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
     lua_pushstring(L, "locked");
     lua_setfield(L, -2, "__metatable");
     lua_setfield(L, LUA_REGISTRYINDEX, "reskate.permissions");
-    add_functions(L, "skater", {{"state", state}, {"surface_sound", surface_sound}, {"rolling_sound", rolling_sound}, {"noclip", noclip}, {"boost", boost}, {"freeze", freeze}, {"wipeout", wipeout}, {"xray", xray},
+    add_functions(L, "skater", {{"state", state}, {"surface_sound", surface_sound}, {"noclip", noclip}, {"boost", boost}, {"freeze", freeze}, {"wipeout", wipeout}, {"xray", xray},
                                 {"shape_launch", shape_launch}, {"hide", hide_skater}, {"reach", reach}, {"carry", carry}, {"hand", hand}, {"joint", skater_joint}, {"pose", skater_pose}});
     add_functions(L, "board", {{"motion", board_motion}, {"bones", board_bones}, {"set", board_set}, {"hide", board_hide}, {"clear", board_clear}, {"scale", board_scale},
                                {"park", board_park}, {"fit", board_fit}, {"toss", board_toss}, {"parameters", board_parameters},

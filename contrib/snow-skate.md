@@ -116,18 +116,6 @@ game only sends the fields that changed, so the whole state is sent again when t
 every 30 updates; without that, some fields kept the old surface after a respawn. `session.cpp` follows the
 local sound outside a multiplayer session too.
 
-## `reskate.skater.rolling_sound(volume | nil)`
-
-Permission: `skater.control`.
-
-The local skater's rolling sound (its wheels' roll) plays as loud as the game has it times `volume` (0 to 1: 0 is
-none); `nil` gives the game's own back. One plugin at a time, let go when it stops. It scales the roll value of
-the skater's sound updates (`native_audio.cpp`, the same hook as the surface sound), so the rest (landings,
-grinds, slides) is untouched.
-
-**What Snow Skate uses it for:** the snowskate deck has no wheels: on bare ground (under cover, or where the snow
-has melted) its rolling sound is off, and the mod plays its own scrape instead (`reskate.audio`).
-
 ## `reskate.world.time()`
 
 Permission: `world.environment`.

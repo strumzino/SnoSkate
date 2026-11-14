@@ -16,7 +16,4 @@ std::uint64_t played_audio_frames() noexcept;
 // (0: each surface its own sound). Others in a session hear it too: they hear what the skater's
 // sound updates say.
 void set_surface_sound(std::uint32_t word, std::uint32_t fields = ~0U) noexcept;
-// The local skater's rolling sound, as loud as the game has it times `volume` (0 to 1; 1: the game's own): the
-// sound updates' wheels' roll (0xb4, high while it rolls, near none in a powerslide, standing or on foot).
-void set_rolling_sound(float volume) noexcept;
 } // namespace dingosdk::multiplayer

@@ -424,11 +424,6 @@ struct FakeGame final : Game {
         surface_fields = fields;
         return {};
     }
-    std::vector<std::optional<float>> rolling_set; // each rolling_sound asked for
-    std::string skater_rolling_sound(std::string_view, std::optional<float> volume) override {
-        rolling_set.push_back(volume);
-        return {};
-    }
     // Each trainer preset held (its name, and its values) or let go (nullopt).
     std::vector<std::optional<std::pair<std::string, std::map<std::string, double, std::less<>>>>> trainer_presets;
     std::string trainer_preset(std::string_view, std::string_view name, std::optional<std::map<std::string, double, std::less<>>> values) override {
@@ -1586,29 +1581,6 @@ void the_skater_surface_sound_is_set_for_some_fields() {
     )")});
     running(denied, "surface-denied", denied_environment);
     check(!denied_environment.fake.surface_set, "a plugin without skater.control set no surface sound");
-}
-
-void the_skater_rolling_sound_is_turned_down() {
-    TestEnvironment environment;
-    Host host(environment, Side::client);
-    host.apply({script("rolling-sound", R"(
-        assert(reskate.skater.rolling_sound(0))
-        assert(reskate.skater.rolling_sound(0.25))
-        assert(not pcall(reskate.skater.rolling_sound, 2), "a volume is 0 to 1")
-        assert(not pcall(reskate.skater.rolling_sound, -0.5), "a volume is 0 to 1")
-        assert(reskate.skater.rolling_sound(nil))
-    )", R"("skater.control")")});
-    running(host, "rolling-sound", environment);
-    check(environment.fake.rolling_set.size() == 3 && environment.fake.rolling_set[0] == 0.0f && environment.fake.rolling_set[1] == 0.25f &&
-              !environment.fake.rolling_set[2],
-          "rolling_sound passes its volume on, and nil lets go");
-    TestEnvironment denied_environment;
-    Host denied(denied_environment, Side::client);
-    denied.apply({script("rolling-denied", R"(
-        assert(not pcall(reskate.skater.rolling_sound, 0), "needs skater.control")
-    )")});
-    running(denied, "rolling-denied", denied_environment);
-    check(denied_environment.fake.rolling_set.empty(), "a plugin without skater.control did not turn the rolling sound down");
 }
 
 void a_variant_can_wait_for_the_next_launch() {
@@ -7411,7 +7383,6 @@ int main() {
         run(a_variant_can_wait_for_the_next_launch);
         run(a_plugin_holds_a_trainer_preset);
         run(the_skater_surface_sound_is_set_for_some_fields);
-        run(the_skater_rolling_sound_is_turned_down);
         run(the_time_of_day_is_read_and_the_cover_melts);
         run(ui_value_reservations_enforce_limits_and_collisions);
         run(plugins_publish_only_their_own_ui_values);

@@ -1988,13 +1988,6 @@ public:
         else surfacer_.clear();
         return {};
     }
-    std::string skater_rolling_sound(std::string_view plugin, std::optional<float> volume) override {
-        if (!roller_.empty() && roller_ != plugin) return "another plugin sets the skater's rolling sound";
-        multiplayer::set_rolling_sound(volume.value_or(1.0f));
-        if (volume) roller_ = std::string(plugin);
-        else roller_.clear();
-        return {};
-    }
     std::string freeze(std::string_view plugin, bool on) override {
         const bool before = !freezers_.empty();
         if (on) {
@@ -2100,10 +2093,6 @@ public:
             multiplayer::set_surface_sound(0);
             surfacer_.clear();
         }
-        if (roller_ == plugin) {
-            multiplayer::set_rolling_sound(1.0f);
-            roller_.clear();
-        }
         if (coverer_ == plugin) {
             world_cover::clear();
             world_cover::keep_clear({});
@@ -2196,7 +2185,6 @@ private:
     std::uint64_t pose_at_{};
     std::string looker_;  // the plugin whose look is on the screen (screen_look)
     std::string surfacer_; // the plugin whose surface sound the local skater's sounds have
-    std::string roller_;   // the plugin that turns the local skater's rolling sound down
     std::string coverer_; // the plugin whose cover is over the world (world_cover)
     std::string viewmodeler_; // the plugin whose viewmodel is loaded (viewmodel_load)
     std::uint64_t look_at_{};
