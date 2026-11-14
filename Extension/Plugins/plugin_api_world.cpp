@@ -86,6 +86,15 @@ struct WorldApi {
         }
         return result(L, game_of(plugin).skater_rolling_sound(plugin.id(), volume));
     }
+    // Research (the sound-research branch, not for merging): sound_value(offset or nil, value): one float of the
+    // local skater's sound updates put to value in every update; nil lets go.
+    static int sound_value(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "skater.control", "reskate.skater.sound_value");
+        const auto offset = lua_isnoneornil(L, 1) ? 0u : static_cast<std::uint32_t>(luaL_checknumber(L, 1));
+        const auto value = static_cast<float>(luaL_optnumber(L, 2, 0));
+        return result(L, game_of(plugin).skater_sound_value(offset, value));
+    }
     static int control(lua_State* L, const char* action) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "skater.control", "reskate.skater control");
@@ -3633,7 +3642,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
     lua_pushstring(L, "locked");
     lua_setfield(L, -2, "__metatable");
     lua_setfield(L, LUA_REGISTRYINDEX, "reskate.permissions");
-    add_functions(L, "skater", {{"state", state}, {"surface_sound", surface_sound}, {"rolling_sound", rolling_sound}, {"noclip", noclip}, {"boost", boost}, {"freeze", freeze}, {"wipeout", wipeout}, {"xray", xray},
+    add_functions(L, "skater", {{"state", state}, {"surface_sound", surface_sound}, {"rolling_sound", rolling_sound}, {"sound_value", sound_value}, {"noclip", noclip}, {"boost", boost}, {"freeze", freeze}, {"wipeout", wipeout}, {"xray", xray},
                                 {"shape_launch", shape_launch}, {"hide", hide_skater}, {"reach", reach}, {"carry", carry}, {"hand", hand}, {"joint", skater_joint}, {"pose", skater_pose}});
     add_functions(L, "board", {{"motion", board_motion}, {"bones", board_bones}, {"set", board_set}, {"hide", board_hide}, {"clear", board_clear}, {"scale", board_scale},
                                {"park", board_park}, {"fit", board_fit}, {"toss", board_toss}, {"parameters", board_parameters},

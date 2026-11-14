@@ -1995,6 +1995,10 @@ public:
         else roller_.clear();
         return {};
     }
+    std::string skater_sound_value(std::uint32_t offset, float value) override {
+        multiplayer::set_sound_value(offset, value);
+        return {};
+    }
     std::string freeze(std::string_view plugin, bool on) override {
         const bool before = !freezers_.empty();
         if (on) {

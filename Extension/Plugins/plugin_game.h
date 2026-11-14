@@ -808,6 +808,8 @@ public:
     // The local skater's rolling sound (its wheels' roll) as loud as the game has it times `volume` (0 to 1);
     // nothing: the game's own. One plugin at a time.
     virtual std::string skater_rolling_sound(std::string_view /*plugin*/, std::optional<float> /*volume*/) { return unavailable; }
+    // Research (not for merging): one float of the local skater's sound updates put to a value (offset 0: none).
+    virtual std::string skater_sound_value(std::uint32_t /*offset*/, float /*value*/) { return unavailable; }
     // ---- the session's authority (plugins' server copies) --------------------------------------------
     // Drops a player from the session; a chat line to everyone; one to one player (a dedicated
     // server's only: a lobby has no private chat); moves a player's skater (their game does the move).

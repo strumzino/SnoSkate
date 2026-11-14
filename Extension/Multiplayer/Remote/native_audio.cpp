@@ -53,6 +53,8 @@ struct State {
     std::unique_ptr<NativeAudioFrame> as_given = std::make_unique<NativeAudioFrame>();
     std::atomic<std::uint32_t> surface_sound{}, surface_fields{~0U};
     std::atomic<float> rolling_volume{1.0f}; // set_rolling_sound
+    std::atomic<std::uint32_t> value_offset{}; // research: set_sound_value
+    std::atomic<float> value_put{};
     std::atomic<bool> surface_resend{}; // the whole state goes once (the surface sound changed)
     int surface_resend_in{};            // local updates until it goes whole (0: not waiting); under mutex
     unsigned surface_updates{};         // local updates with a surface sound, for its regular resend; under mutex
@@ -200,6 +202,16 @@ void submit_hook(Address handle, const NativeAudioFrame *frame) {
                 copy(&game_now, &given, masks.data());
                 audio_put(full, 0xb4, audio_value<float>(game_now, 0xb4) * rolling);
             }
+            // Research: one float put to a value in every update (set_sound_value).
+            if (const auto offset = s.value_offset.load(std::memory_order_acquire); offset) {
+                if (!send_full) {
+                    full = *s.accumulated;
+                    copy(&full, &snapshot, masks.data());
+                    if (sound_word) put_surface_sound(s, full, sound_word);
+                    send_full = true;
+                }
+                audio_put(full, offset, s.value_put.load(std::memory_order_acquire));
+            }
             if (send_full) {
                 for (const auto off : {0x164, 0x130, 0x124})
                     audio_put(full, off, UINT32_MAX);
@@ -341,6 +353,13 @@ void set_rolling_sound(float volume) noexcept {
     auto &s = state();
     s.rolling_volume.store(std::clamp(volume, 0.0f, 1.0f), std::memory_order_release);
     s.surface_resend.store(true, std::memory_order_release); // (back to the game's own: sent whole once)
+}
+void set_sound_value(std::uint32_t offset, float value) noexcept {
+    auto &s = state();
+    const bool known = std::find(audio_float_offsets.begin(), audio_float_offsets.end(), offset) != audio_float_offsets.end();
+    s.value_put.store(value, std::memory_order_release);
+    s.value_offset.store(known ? offset : 0, std::memory_order_release);
+    s.surface_resend.store(true, std::memory_order_release);
 }
 std::vector<AudioSample> drain_audio_capture(std::uint64_t now) {
     auto &s = state();
