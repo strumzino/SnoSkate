@@ -991,6 +991,25 @@ void take_measurements(Shared& s, const std::uint8_t* rows) {
                         best_count, measure_columns);
 }
 
+// Whether this frame's picture can measure the near distance on the skater (ps_measure): the skater's body,
+// from under their place to over their head, before the camera and tall enough on screen that its 32 points
+// fall on it a few pixels apart. A camera far over the skater (a drone, a free camera high in the sky) saw
+// them a few pixels tall or end on: the points all read the ground beside them, which agreed with each
+// other, and the near distance held went wrong for good, and the snow with it (2026-11-15).
+bool skater_measurable(const std::array<float, camera_floats>& m, float focal, const std::vector<Clear>& clear) {
+    if (clear.empty() || focal <= 0) return false;
+    constexpr float lowest = -0.4f, highest = 1.6f; // as ps_measure's points
+    constexpr float least_pixels = 64;               // two a point
+    float along[2]{}, up[2]{};
+    for (int k = 0; k < 2; ++k) {
+        const float to[3] = {clear[0].foot[0] - m[9], clear[0].foot[1] + (k ? highest : lowest) - m[10], clear[0].foot[2] - m[11]};
+        along[k] = -(to[0] * m[6] + to[1] * m[7] + to[2] * m[8]);
+        up[k] = to[0] * m[3] + to[1] * m[4] + to[2] * m[5];
+        if (along[k] < 0.3f) return false;
+    }
+    return std::abs(up[1] / along[1] - up[0] / along[0]) * focal >= least_pixels;
+}
+
 bool record_cover(Shared& s) {
     s.why = "nothing to draw into";
     if (s.failed || !s.colour || !s.main_depth) return false;
@@ -1375,7 +1394,7 @@ bool record_cover(Shared& s) {
     // Only once the list is closed (it goes to the GPU now): one that failed to close never runs, and its
     // slot read back next time would be an older frame's, taken as this one's.
     s.measure_waiting[at] = true;
-    s.measure_fresh[at] = s.depth_copied_frame == s.frame;
+    s.measure_fresh[at] = s.depth_copied_frame == s.frame && skater_measurable(camera, projector->focal, clear);
     s.timer_waiting[at] = s.timer_heap != nullptr;
     s.last_drawn_frame = s.frame;
     s.why = nullptr;
