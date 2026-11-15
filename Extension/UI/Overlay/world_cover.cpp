@@ -272,9 +272,6 @@ struct Shared {
     // The cameras of this and the last two frames, newest first, and how many are known.
     std::array<std::array<float, camera_floats>, camera_history> cameras{};
     std::size_t cameras_known{};
-    // The camera each time it changed, and when (now_us), oldest first: the picture's camera is counted back in these.
-    std::deque<std::pair<std::uint64_t, std::array<float, camera_floats>>> camera_changes;
-    double change_us{}; // how long between the camera's changes, eased (moving)
     unsigned cost_frames{}; // frames since the cost was last said
     double frame_us{};             // how long a frame takes, eased (present to present)
     std::uint64_t last_present_us{};
@@ -994,25 +991,6 @@ void take_measurements(Shared& s, const std::uint8_t* rows) {
                         best_count, measure_columns);
 }
 
-// Whether this frame's picture can measure the near distance on the skater (ps_measure): the skater's body,
-// from under their place to over their head, before the camera and tall enough on screen that its 32 points
-// fall on it a few pixels apart. A camera far over the skater (a drone, a free camera high in the sky) saw
-// them a few pixels tall or end on: the points all read the ground beside them, which agreed with each
-// other, and the near distance held went wrong for good, and the snow with it (2026-11-15).
-bool skater_measurable(const std::array<float, camera_floats>& m, float focal, const std::vector<Clear>& clear) {
-    if (clear.empty() || focal <= 0) return false;
-    constexpr float lowest = -0.4f, highest = 1.6f; // as ps_measure's points
-    constexpr float least_pixels = 64;               // two a point
-    float along[2]{}, up[2]{};
-    for (int k = 0; k < 2; ++k) {
-        const float to[3] = {clear[0].foot[0] - m[9], clear[0].foot[1] + (k ? highest : lowest) - m[10], clear[0].foot[2] - m[11]};
-        along[k] = -(to[0] * m[6] + to[1] * m[7] + to[2] * m[8]);
-        up[k] = to[0] * m[3] + to[1] * m[4] + to[2] * m[5];
-        if (along[k] < 0.3f) return false;
-    }
-    return std::abs(up[1] / along[1] - up[0] / along[0]) * focal >= least_pixels;
-}
-
 bool record_cover(Shared& s) {
     s.why = "nothing to draw into";
     if (s.failed || !s.colour || !s.main_depth) return false;
@@ -1111,47 +1089,6 @@ bool record_cover(Shared& s) {
         float* const v = camera.data() + axis * 3;
         const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
         if (length > 1e-6f) v[0] /= length, v[1] /= length, v[2] /= length;
-    }
-    // Counted in the camera's own changes, not in frames: camera_delay changes before its newest, while it is moving.
-    // The game moves some cameras only on its update ticks, fewer than the frames drawn (the free camera an FPV drone
-    // mod flies: about 60 a second against 82 to 100 frames, 2026-11-15). Counted in frames, the camera taken was the
-    // one drawn with on some frames and a tick newer on others, and in a fast turn patches of the snow went for a
-    // frame. Taken by time between its changes it leant newer still, and the patches went on every turn. A camera
-    // that moves every frame gives the same as counting frames. Once it has stopped (no change in longer than its
-    // changes usually come), the picture has caught up with it: its newest.
-    {
-        const std::uint64_t now_time = now_us();
-        const auto& newest = s.cameras[0];
-        auto& changes = s.camera_changes;
-        if (changes.empty() || changes.back().second != newest) {
-            if (!changes.empty()) {
-                const auto gap = static_cast<double>(now_time - changes.back().first);
-                if (gap < 100000) s.change_us = s.change_us > 0 ? s.change_us + (gap - s.change_us) * 0.1 : gap;
-            }
-            changes.emplace_back(now_time, newest);
-        }
-        while (changes.size() > 4) changes.pop_front();
-        const double change_time = s.change_us > 0 ? s.change_us : 16667.0;
-        const bool moving = static_cast<double>(now_time - changes.back().first) < change_time * 1.5;
-        if (!moving) camera = changes.back().second;
-        else if (changes.size() >= 3) {
-            const auto whole = static_cast<std::size_t>(camera_delay);
-            const float part = camera_delay - static_cast<float>(whole);
-            const std::size_t n = changes.size();
-            const auto& one = changes[n - 1 - std::min(whole, n - 1)].second;
-            const auto& two = changes[n - 1 - std::min(whole + 1, n - 1)].second;
-            camera = one;
-            // A jump (a cut, a teleport) is not blended through.
-            const float dx = two[9] - one[9], dy = two[10] - one[10], dz = two[11] - one[11];
-            if (dx * dx + dy * dy + dz * dz < 25.0f) {
-                for (std::size_t k = 0; k < camera_floats; ++k) camera[k] += (two[k] - one[k]) * part;
-                for (std::size_t axis = 0; axis < 3; ++axis) {
-                    float* const v = camera.data() + axis * 3;
-                    const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-                    if (length > 1e-6f) v[0] /= length, v[1] /= length, v[2] /= length;
-                }
-            }
-        }
     }
     // (The camera the game drew with was read from its constant buffers for a while, 2026-11-13 to 11-15. The game
     // no longer kept that camera where it was read, and the one found in its place was not the one it drew with:
@@ -1438,7 +1375,7 @@ bool record_cover(Shared& s) {
     // Only once the list is closed (it goes to the GPU now): one that failed to close never runs, and its
     // slot read back next time would be an older frame's, taken as this one's.
     s.measure_waiting[at] = true;
-    s.measure_fresh[at] = s.depth_copied_frame == s.frame && skater_measurable(camera, projector->focal, clear);
+    s.measure_fresh[at] = s.depth_copied_frame == s.frame;
     s.timer_waiting[at] = s.timer_heap != nullptr;
     s.last_drawn_frame = s.frame;
     s.why = nullptr;
@@ -1887,8 +1824,6 @@ void release() noexcept {
         s.timer_waiting = {};
         s.relearning = false;
         s.cameras_known = 0;
-        s.camera_changes.clear();
-        s.change_us = 0;
         s.nears.clear();
         s.held_near = 0;
         s.shown_near = 0;
