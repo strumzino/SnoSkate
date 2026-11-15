@@ -128,7 +128,9 @@ std::atomic<ExecuteFn> original_execute{};
 // fixed delay was right only on average and world-fixed things (trails) still moved a little.
 using RootViewFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
 std::atomic<RootViewFn> original_compute_cbv{};
-constexpr std::size_t bound_kept = 64;
+// All of a frame's: with only the newest 32 looked at, 19,200 binds over 600 frames held a camera 16 times
+// (2026-11-15), the camera's buffers bound earlier in the frame than those.
+constexpr std::size_t bound_kept = 1024;
 std::array<std::atomic<std::uint64_t>, bound_kept> bound_addresses{};
 std::atomic<std::uint64_t> bound_count{};
 
@@ -276,7 +278,8 @@ struct Shared {
     unsigned game_camera_frames{}, camera_frames{}, camera_reports{};
     // Where reading it went, over the same 600 frames (said with them): binds looked at, read, holding a camera,
     // and close to the one read from the game.
-    std::uint64_t camera_binds{}, camera_reads{}, camera_held{}, camera_close{};
+    std::uint64_t camera_binds{}, camera_distinct{}, camera_reads{}, camera_held{}, camera_close{};
+    std::uint64_t camera_binds_most{}, bound_seen_before{}; // the most binds in one frame
     std::array<float, 3> camera_signs{1, 1, 1}; // which way round each of its axes is against ours
     float places_back = camera_delay; // how many frames back the places are taken (the drawn camera's, as found)
     // The places kept clear as each of those frames was drawn, newest first: a place on something that moves
@@ -565,6 +568,15 @@ void save_shader_cache(const std::filesystem::path& path, const std::map<std::st
     }
     std::filesystem::rename(partial, path, error);
     if (error) std::filesystem::remove(partial, error);
+}
+bool has_shader_cache() {
+    try {
+        std::error_code error;
+        const auto path = shader_cache_file();
+        return !path.empty() && std::filesystem::exists(path, error);
+    } catch (...) {
+        return false;
+    }
 }
 void start_compiling() {
     auto& c = compiled();
@@ -1001,15 +1013,21 @@ void STDMETHODCALLTYPE hooked_compute_cbv(ID3D12GraphicsCommandList* list, UINT 
 // Its buffer is read through the GPU memory watch (gpu_diagnostics.h). False when there is none.
 bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
     const auto end = bound_count.load();
-    constexpr std::uint64_t looked_most = 32;
+    constexpr std::uint64_t looked_most = bound_kept;
     const auto begin = std::max(s.bound_seen, end > looked_most ? end - looked_most : std::uint64_t{0});
     s.bound_seen = end;
+    s.camera_binds_most = std::max<std::uint64_t>(s.camera_binds_most, end - s.bound_seen_before);
+    s.bound_seen_before = end;
     std::vector<std::array<float, camera_floats>> held; // as the buffers have them, newest first
+    std::vector<std::uint64_t> looked; // each address once a frame (the game binds one buffer for many dispatches)
     std::array<float, 20> f{};
     for (auto n = end; n > begin; --n) {
         const auto address = bound_addresses[(n - 1) % bound_kept].load(std::memory_order_relaxed);
         ++s.camera_binds;
-        if (!address || overlay::read_gpu_buffer(address, f.data(), sizeof(f)) < sizeof(f)) continue;
+        if (!address || std::find(looked.begin(), looked.end(), address) != looked.end()) continue;
+        looked.push_back(address);
+        ++s.camera_distinct;
+        if (overlay::read_gpu_buffer(address, f.data(), sizeof(f)) < sizeof(f)) continue;
         ++s.camera_reads;
         const float* const rows = f.data() + 4;
         std::array<float, camera_floats> one{};
@@ -1212,12 +1230,13 @@ bool record_cover(Shared& s) {
             ++s.camera_reports;
             logging::printf(logging::Level::info, logging::Channel::graphics,
                             "World cover: the game's own camera was read in %u of the last 600 frames (else the one %.2f frames back); "
-                            "its binds %llu, read %llu, holding a camera %llu, close to ours %llu.",
+                            "its binds %llu (at most %llu a frame), different %llu, read %llu, holding a camera %llu, close to ours %llu.",
                             s.game_camera_frames, camera_delay, static_cast<unsigned long long>(s.camera_binds),
+                            static_cast<unsigned long long>(s.camera_binds_most), static_cast<unsigned long long>(s.camera_distinct),
                             static_cast<unsigned long long>(s.camera_reads), static_cast<unsigned long long>(s.camera_held),
                             static_cast<unsigned long long>(s.camera_close));
         }
-        s.camera_binds = s.camera_reads = s.camera_held = s.camera_close = 0;
+        s.camera_binds = s.camera_distinct = s.camera_reads = s.camera_held = s.camera_close = s.camera_binds_most = 0;
         s.camera_frames = s.game_camera_frames = 0;
         // What it costs: on the GPU a frame, and the roof map's rays on the game's update thread a tick.
         const auto ticks = roof_ticks.exchange(0), rays = roof_rays.exchange(0), roof_us = roof_us_total.exchange(0), roof_most = roof_us_most.exchange(0);
@@ -1808,7 +1827,10 @@ void install(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsComm
     // A cover drawn in a recent launch: its shaders compile now, on their own thread (no hook, and nothing on the
     // game's drawing thread), so it shows as soon as a plugin asks for it. Compiled only at the first cover, it
     // showed a few seconds late each launch (2026-11-15).
-    if (overlay::cover_used_recently()) start_compiling();
+    // A cache of them already on disk is read only when a cover is asked for (it takes no time): with it read here,
+    // as the game started, the game's own pipeline creation failed (E_INVALIDARG) twice in two launches, and in
+    // neither launch without one (2026-11-15). The cause is not known.
+    if (overlay::cover_used_recently() && !has_shader_cache()) start_compiling();
     if (wanted.load()) ensure_hooks(); // a cover asked for before the overlay's graphics were up
 }
 
