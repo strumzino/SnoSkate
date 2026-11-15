@@ -283,6 +283,8 @@ struct Shared {
     // and close to the one read from the game.
     std::uint64_t camera_binds{}, camera_distinct{}, camera_reads{}, camera_held{}, camera_close{};
     std::uint64_t camera_binds_most{}, bound_seen_before{}; // the most binds in one frame
+    std::array<std::uint64_t, 3> camera_forms{}; // research: cameras found as rows, columns with the eye, columns of a view
+    std::map<std::string, std::uint64_t> camera_offsets; // research: each offset and form found, how often
     std::array<float, 3> camera_signs{1, 1, 1}; // which way round each of its axes is against ours
     float places_back = camera_delay; // how many frames back the places are taken (the drawn camera's, as found)
     // The places kept clear as each of those frames was drawn, newest first: a place on something that moves
@@ -1024,33 +1026,62 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
     s.bound_seen_before = end;
     std::vector<std::array<float, camera_floats>> held; // as the buffers have them, newest first
     std::vector<std::uint64_t> looked; // each address once a frame (the game binds one buffer for many dispatches)
-    std::array<float, 20> f{};
+    // The first 256 bytes of each, searched at every offset: the camera's axes as rows with where it is in the
+    // fourth row (16 bytes in, as found 2026-11-13), or as columns with it in the fourth column, either where it
+    // is or a view matrix's translation (the axes' dot with it, negated). The research build found it at +112
+    // and +64 bytes as columns on 2026-11-15, and never at +16 as rows any more.
+    std::array<float, 64> f{};
+    const std::array<float, 3> eye_now{camera[9], camera[10], camera[11]};
+    const auto near_eye = [&](const std::array<float, 3>& e) {
+        for (std::size_t c = 0; c < 3; ++c)
+            if (!std::isfinite(e[c]) || std::abs(e[c] - eye_now[c]) >= 2.0f) return false;
+        return true;
+    };
     for (auto n = end; n > begin; --n) {
         const auto address = bound_addresses[(n - 1) % bound_kept].load(std::memory_order_relaxed);
         ++s.camera_binds;
         if (!address || std::find(looked.begin(), looked.end(), address) != looked.end()) continue;
         looked.push_back(address);
         ++s.camera_distinct;
-        if (overlay::read_gpu_buffer(address, f.data(), sizeof(f)) < sizeof(f)) continue;
+        const auto got = overlay::read_gpu_buffer(address, f.data(), sizeof(f)) / sizeof(float);
+        if (got < 16) continue;
         ++s.camera_reads;
-        const float* const rows = f.data() + 4;
-        std::array<float, camera_floats> one{};
-        bool ok = true;
-        for (std::size_t a = 0; a < 3 && ok; ++a) {
-            float length = 0;
-            for (std::size_t c = 0; c < 3; ++c) {
-                const float v = rows[a * 4 + c];
-                ok = ok && std::isfinite(v);
-                length += v * v;
-                one[a * 3 + c] = v;
+        for (std::size_t i = 0; i + 15 <= got; ++i) {
+            for (const bool columns : {false, true}) {
+                const std::size_t stride = columns ? 4 : 1, apart = columns ? 1 : 4;
+                std::array<float, camera_floats> one{};
+                bool ok = true;
+                for (std::size_t a = 0; a < 3 && ok; ++a) {
+                    float length = 0;
+                    for (std::size_t c = 0; c < 3; ++c) {
+                        const float v = f[i + a * apart + c * stride];
+                        ok = ok && std::isfinite(v);
+                        length += v * v;
+                        one[a * 3 + c] = v;
+                    }
+                    ok = ok && std::abs(length - 1.0f) < 0.02f;
+                }
+                if (!ok) continue;
+                std::array<float, 3> eye{};
+                int form = -1; // 0 rows, eye in the fourth row; 1 columns, eye in the fourth column; 2 columns, a view's translation
+                if (!columns) {
+                    eye = {f[i + 12], f[i + 13], f[i + 14]};
+                    if (near_eye(eye)) form = 0;
+                } else {
+                    const std::array<float, 3> t{f[i + 3], f[i + 7], f[i + 11]};
+                    if (near_eye(t)) eye = t, form = 1;
+                    else {
+                        for (std::size_t c = 0; c < 3; ++c) eye[c] = -(t[0] * one[c] + t[1] * one[3 + c] + t[2] * one[6 + c]);
+                        if (near_eye(eye)) form = 2;
+                    }
+                }
+                if (form < 0) continue;
+                for (std::size_t c = 0; c < 3; ++c) one[9 + c] = eye[c];
+                held.push_back(one);
+                ++s.camera_forms[static_cast<std::size_t>(form)];
+                s.camera_offsets[std::format("{}{}", i * 4, form == 0 ? "r" : form == 1 ? "c" : "v")] += 1;
             }
-            ok = ok && std::abs(length - 1.0f) < 0.02f;
         }
-        for (std::size_t c = 0; c < 3 && ok; ++c) {
-            ok = std::isfinite(rows[12 + c]) && std::abs(rows[12 + c]) < 1e6f;
-            one[9 + c] = rows[12 + c];
-        }
-        if (ok) held.push_back(one);
     }
     s.camera_held += held.size();
     const auto turned = [&](const std::array<float, camera_floats>& one) {
@@ -1239,6 +1270,16 @@ bool record_cover(Shared& s) {
                             static_cast<unsigned long long>(s.camera_binds_most), static_cast<unsigned long long>(s.camera_distinct),
                             static_cast<unsigned long long>(s.camera_reads), static_cast<unsigned long long>(s.camera_held),
                             static_cast<unsigned long long>(s.camera_close));
+        }
+        {
+            std::string offsets;
+            for (const auto& [where, count] : s.camera_offsets) offsets += std::format(" +{} x{}", where, count);
+            logging::printf(logging::Level::info, logging::Channel::graphics,
+                            "World cover (research): cameras found as rows %llu, as columns with the eye %llu, as a view's columns %llu; at%s.",
+                            static_cast<unsigned long long>(s.camera_forms[0]), static_cast<unsigned long long>(s.camera_forms[1]),
+                            static_cast<unsigned long long>(s.camera_forms[2]), offsets.c_str());
+            s.camera_forms = {};
+            s.camera_offsets.clear();
         }
         s.camera_binds = s.camera_distinct = s.camera_reads = s.camera_held = s.camera_close = s.camera_binds_most = 0;
         s.camera_frames = s.game_camera_frames = 0;
