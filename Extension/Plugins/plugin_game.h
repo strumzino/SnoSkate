@@ -11,6 +11,7 @@
 #include "Extension/Skater/pose_place.h"
 #include "Extension/Throwdowns/throwdown_kit.h"
 #include "Extension/UI/score_line.h"
+#include "Extension/UI/Overlay/screen_shader_file.h"
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -1102,6 +1103,16 @@ public:
         std::array<std::string, 5> text;
     };
     virtual std::string screen_look(std::string_view /*plugin*/, std::optional<ScreenLook>) { return unavailable; }
+    // The plugin's own pixel shader over the game's picture (reskate.screen.shader; Extension/UI/Overlay/screen_shader.h):
+    // `file` its path in the package, `bytes` its content as checked (screen_shader::check_file), `values` the numbers
+    // it is given. None: the plugin's ends. Empty, or why it is not drawn.
+    struct ScreenShader {
+        std::string file;
+        std::shared_ptr<const std::string> bytes;
+        screen_shader::Kind kind{};
+        std::array<float, screen_shader::value_count> values{};
+    };
+    virtual std::string screen_shader(std::string_view /*plugin*/, std::optional<ScreenShader>) { return unavailable; }
     // A hand slaps the lens, while this plugin has the look.
     virtual std::string screen_slap(std::string_view /*plugin*/) { return unavailable; }
     // The skater bails as from a slam of `force` (0.5 to 3); not in a throwdown. While No Bail protects

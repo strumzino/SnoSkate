@@ -3355,6 +3355,49 @@ struct WorldApi {
         lua_pop(L, 1);
         return result(L, game_of(plugin).screen_look(plugin.id(), look));
     }
+    // screen.shader(file, values): the plugin's own pixel shader (a file in its package: .hlsl, or a compiled .cso,
+    // .dxbc or .dxil; Extension/UI/Overlay/screen_shader_file.h says what it is given) over the game's picture for
+    // 0.3 s, so every tick; nil ends it. `values`: up to 48 numbers, the shader's reskate_values (four to a float4).
+    // One plugin's at a time. True, or nil and why it is not drawn (another plugin's is on, or this one did not
+    // compile, was refused or took too long on the GPU, which keeps it off for the run). A file that is not a screen
+    // shader at all, or values that are not numbers, are an error.
+    static int screen_shader(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "screen.shader", "reskate.screen.shader");
+        if (lua_isnoneornil(L, 1)) return result(L, game_of(plugin).screen_shader(plugin.id(), std::nullopt));
+        const std::string path = luaL_checkstring(L, 1);
+        Game::ScreenShader shader;
+        shader.file = path;
+        if (!lua_isnoneornil(L, 2)) {
+            luaL_checktype(L, 2, LUA_TTABLE);
+            const auto count = lua_objlen(L, 2);
+            if (count > static_cast<int>(screen_shader::value_count))
+                luaL_error(L, "a screen shader takes at most %d values", static_cast<int>(screen_shader::value_count));
+            for (int i = 1; i <= count; ++i) {
+                lua_rawgeti(L, 2, i);
+                if (lua_type(L, -1) != LUA_TNUMBER) luaL_error(L, "a screen shader's values are numbers");
+                const double v = lua_tonumber(L, -1);
+                if (!std::isfinite(v) || std::abs(v) > 1e30) luaL_error(L, "a screen shader's values are finite numbers");
+                shader.values[static_cast<std::size_t>(i - 1)] = static_cast<float>(v);
+                lua_pop(L, 1);
+            }
+        }
+        auto found = plugin.shader_files_.find(path);
+        if (found == plugin.shader_files_.end()) {
+            const Plugin::Untimed untimed{plugin}; // reading it
+            std::string error;
+            auto bytes = read_package_file(package_file(L, plugin, path), screen_shader::most_compiled_bytes, error);
+            if (bytes.empty()) luaL_error(L, "the screen shader %s cannot be read: %s", path.c_str(), error.empty() ? "it is empty" : error.c_str());
+            screen_shader::Kind kind{};
+            if (const auto why = screen_shader::check_file(path, bytes, kind); !why.empty())
+                luaL_error(L, "the screen shader %s cannot be used: %s", path.c_str(), why.c_str());
+            if (plugin.shader_files_.size() >= 8) plugin.shader_files_.clear(); // a few kept, not every one ever used
+            found = plugin.shader_files_.emplace(path, Plugin::CachedShader{std::make_shared<const std::string>(std::move(bytes)), kind}).first;
+        }
+        shader.bytes = found->second.bytes;
+        shader.kind = found->second.kind;
+        return result(L, game_of(plugin).screen_shader(plugin.id(), std::move(shader)));
+    }
     static int screen_slap(lua_State* L) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "overlay", "reskate.screen.slap");
@@ -3548,7 +3591,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
                                {"write", input_write}, {"hide", input_hide}, {"cursor", input_cursor}, {"text", input_text}});
     add_functions(L, "room", {{"open", room_open}, {"leave", room_leave}, {"state", room_state}});
     add_functions(L, "ui", {{"screen", screen}, {"open", open}, {"close", close}});
-    add_functions(L, "screen", {{"look", screen_look}, {"slap", screen_slap}});
+    add_functions(L, "screen", {{"look", screen_look}, {"slap", screen_slap}, {"shader", screen_shader}});
 }
 
 std::uint32_t combo_of(std::string_view name) {

@@ -77,6 +77,7 @@
 #include <filesystem>
 #include "Extension/UI/Overlay/overlay.h"
 #include "Extension/UI/Overlay/screen_look.h"
+#include "Extension/UI/Overlay/screen_shader.h"
 #include "Extension/UI/Overlay/viewmodel.h"
 #include "Extension/UI/Overlay/scripted_pad.h"
 #include "Engine/Game/Input/pad_output.h"
@@ -1265,6 +1266,13 @@ public:
         screen_look::set(s);
         return {};
     }
+    std::string screen_shader(std::string_view plugin, std::optional<ScreenShader> shader) override {
+        if (!shader) {
+            screen_shader::clear(plugin);
+            return {};
+        }
+        return screen_shader::set(plugin, shader->file, shader->bytes, shader->kind, shader->values);
+    }
     // ---- viewmodel -----------------------------------------------------------------------------------
     std::string viewmodel_load(std::string_view plugin, const std::filesystem::path& file) override {
         if (!viewmodeler_.empty() && viewmodeler_ != plugin) return viewmodeler_ + " has the viewmodel";
@@ -2035,6 +2043,7 @@ public:
             screen_look::clear();
             looker_.clear();
         }
+        screen_shader::clear(plugin);
         if (viewmodeler_ == plugin) {
             viewmodel::unload();
             viewmodeler_.clear();

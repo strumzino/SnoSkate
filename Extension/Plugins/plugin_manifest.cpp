@@ -47,16 +47,19 @@ namespace {
 // skate.'s score HUD (reskate.hud.score_line, Extension/UI/score_line_hud.h): display only, from a
 // model of the SDK's own, never the game's score, challenges or progression. It stands apart from
 // "hud" so plugins approved for "hud" are not given a new thing on screen without being asked.
+// "screen.shader" runs the plugin's own pixel shader over the finished frame (reskate.screen.shader,
+// Extension/UI/Overlay/screen_shader.h): its only output is the picture, and ReSkate times it on the GPU and turns
+// it off when it takes too long. It stands apart from "overlay": it is code of the plugin's own on the GPU.
 // "replay" grants nothing yet: no API checks it. It stays known so a manifest that lists it still
 // loads (an unknown permission refuses the whole manifest).
-constexpr std::array<std::string_view, 65> permissions{
+constexpr std::array<std::string_view, 66> permissions{
     "console", "storage", "overlay", "menu", "ui.screen", "input", "input.write", "hud", "events.tricks", "events.skater",
     "skater.read", "skater.teleport", "skater.control", "skater.animation", "trainer", "camera",
     "world.raycast", "world.vehicles", "world.physics", "world.physics.observe", "world.physics.reuse", "world.objects", "world.entities", "world.environment", "world.ai", "travel", "session.read",
     "session.skaters", "session.nametags", "net.session", "net.http", "voice.control", "chat.read",
     "chat.send", "chat.local", "chat.commands", "server", "server.parks", "throwdowns", "replay", "music", "progression.read", "settings.read", "audio.ui", "audio", "outfit", "board", "mods.read",
     "events.physics", "game.speed", "files", "variants", "settings.write", "room", "capture", "effects", "events.physics.geometry", "viewmodel", "strings", "outfit.stand_ins",
-    "objects.physics", "marker.read", "ui.models", "hud.score", "effects.game"};
+    "objects.physics", "marker.read", "ui.models", "hud.score", "effects.game", "screen.shader"};
 }
 
 bool known_permission(std::string_view name) noexcept {
