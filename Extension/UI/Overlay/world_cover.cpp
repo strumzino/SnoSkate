@@ -5,6 +5,7 @@
 #include "Engine/Core/Log/logging.h"
 #include "Extension/Plugins/plugin_camera.h"
 #include "Extension/UI/Overlay/gpu_diagnostics.h"
+#include <ShlObj.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -13,7 +14,9 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <mutex>
 #include <map>
 #include <set>
@@ -484,6 +487,82 @@ struct Compiled {
     std::atomic<int> state{}; // 0 not started, 1 compiling, 2 ready, 3 failed
 };
 Compiled& compiled() { static auto* value = new Compiled; return *value; }
+// The compiled shaders kept on disk, so a launch after the first loads them instead of compiling again: the
+// compile took 20 to 30 s on a desktop (2026-11-15), and the cover waited for it every launch. Kept as
+// %LOCALAPPDATA%\ReSkate\shader-cache\world-cover-<hash of the shader source and entries>.bin: each entry's
+// name and bytecode. A changed shader has another name; the old file is removed when the new one is written.
+constexpr std::pair<const char*, const char*> shader_entries[]{{"vs_main", "vs_5_0"}, {"ps_main", "ps_5_0"}, {"ps_measure", "ps_5_0"},
+                                                               {"ps_depth", "ps_5_0"}};
+std::filesystem::path shader_cache_folder() {
+    PWSTR local{};
+    std::filesystem::path path;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DONT_VERIFY, nullptr, &local)))
+        path = std::filesystem::path(local) / L"ReSkate" / L"shader-cache";
+    CoTaskMemFree(local);
+    return path;
+}
+std::filesystem::path shader_cache_file() {
+    const auto folder = shader_cache_folder();
+    if (folder.empty()) return {};
+    std::uint64_t hash = 14695981039346656037ULL; // FNV-1a
+    const auto mix = [&](const char* text) {
+        for (const char* c = text; *c; ++c) hash = (hash ^ static_cast<unsigned char>(*c)) * 1099511628211ULL;
+        hash = (hash ^ 0xffU) * 1099511628211ULL;
+    };
+    mix(world_cover_hlsl);
+    for (const auto& [entry, target] : shader_entries) mix(entry), mix(target);
+    return folder / std::format(L"world-cover-{:016x}.bin", hash);
+}
+// Every entry's bytecode from the cache file, or false (none, or not whole).
+bool load_shader_cache(const std::filesystem::path& path, std::map<std::string, ComPtr<ID3DBlob>>& blobs) {
+    if (path.empty()) return false;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::map<std::string, ComPtr<ID3DBlob>> found;
+    for (std::size_t n = 0; n < std::size(shader_entries); ++n) {
+        std::uint32_t name_size{}, size{};
+        if (!in.read(reinterpret_cast<char*>(&name_size), sizeof(name_size)) || name_size == 0 || name_size > 64) return false;
+        std::string name(name_size, '\0');
+        if (!in.read(name.data(), name_size) || !in.read(reinterpret_cast<char*>(&size), sizeof(size)) || size == 0 || size > (16U << 20)) return false;
+        ComPtr<ID3DBlob> blob;
+        if (FAILED(D3DCreateBlob(size, &blob)) || !blob || !in.read(static_cast<char*>(blob->GetBufferPointer()), size)) return false;
+        found[name] = blob;
+    }
+    for (const auto& entry : shader_entries)
+        if (!found.contains(entry.first)) return false;
+    blobs = std::move(found);
+    return true;
+}
+void save_shader_cache(const std::filesystem::path& path, const std::map<std::string, ComPtr<ID3DBlob>>& blobs) {
+    if (path.empty()) return;
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    // Older shaders' files go.
+    for (const auto& item : std::filesystem::directory_iterator(path.parent_path(), error)) {
+        const auto name = item.path().filename().wstring();
+        if (name.starts_with(L"world-cover-") && item.path() != path) std::filesystem::remove(item.path(), error);
+    }
+    const auto partial = std::filesystem::path(path).concat(L".partial");
+    {
+        std::ofstream out(partial, std::ios::binary | std::ios::trunc);
+        if (!out) return;
+        for (const auto& [name, blob] : blobs) {
+            const auto name_size = static_cast<std::uint32_t>(name.size());
+            const auto size = static_cast<std::uint32_t>(blob->GetBufferSize());
+            out.write(reinterpret_cast<const char*>(&name_size), sizeof(name_size));
+            out.write(name.data(), name_size);
+            out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+            out.write(static_cast<const char*>(blob->GetBufferPointer()), size);
+        }
+        if (!out) {
+            out.close();
+            std::filesystem::remove(partial, error);
+            return;
+        }
+    }
+    std::filesystem::rename(partial, path, error);
+    if (error) std::filesystem::remove(partial, error);
+}
 void start_compiling() {
     auto& c = compiled();
     int idle = 0;
@@ -491,11 +570,25 @@ void start_compiling() {
     try {
         std::thread([] {
             auto& done = compiled();
-            const auto length = std::strlen(world_cover_hlsl);
             const auto started = GetTickCount64();
-            const std::pair<const char*, const char*> entries[]{{"vs_main", "vs_5_0"}, {"ps_main", "ps_5_0"}, {"ps_measure", "ps_5_0"},
-                                                                {"ps_depth", "ps_5_0"}};
-            for (const auto& [entry, target] : entries) {
+            std::filesystem::path cache;
+            try {
+                cache = shader_cache_file();
+                std::map<std::string, ComPtr<ID3DBlob>> cached;
+                if (load_shader_cache(cache, cached)) {
+                    {
+                        std::lock_guard lock(done.mutex);
+                        done.blobs = std::move(cached);
+                    }
+                    done.state.store(2);
+                    logging::printf(logging::Level::info, logging::Channel::graphics, "World cover: its shaders were loaded from the cache in %.2f s.",
+                                    static_cast<double>(GetTickCount64() - started) / 1000.0);
+                    return;
+                }
+            } catch (...) {}
+            const auto length = std::strlen(world_cover_hlsl);
+            std::map<std::string, ComPtr<ID3DBlob>> made;
+            for (const auto& [entry, target] : shader_entries) {
                 ComPtr<ID3DBlob> blob, error;
                 if (FAILED(D3DCompile(world_cover_hlsl, length, "world_cover", nullptr, nullptr, entry, target, 0, 0, &blob, &error)) || !blob) {
                     std::lock_guard lock(done.mutex);
@@ -503,12 +596,18 @@ void start_compiling() {
                     done.state.store(3);
                     return;
                 }
+                made[entry] = blob;
+            }
+            {
                 std::lock_guard lock(done.mutex);
-                done.blobs[entry] = blob;
+                done.blobs = made;
             }
             done.state.store(2);
             logging::printf(logging::Level::info, logging::Channel::graphics, "World cover: its shaders compiled in %.1f s, apart from the game's drawing.",
                             static_cast<double>(GetTickCount64() - started) / 1000.0);
+            try {
+                save_shader_cache(cache, made);
+            } catch (...) {}
         }).detach();
     } catch (...) {
         c.state.store(0);
