@@ -128,9 +128,7 @@ std::atomic<ExecuteFn> original_execute{};
 // fixed delay was right only on average and world-fixed things (trails) still moved a little.
 using RootViewFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
 std::atomic<RootViewFn> original_compute_cbv{};
-// All of a frame's: with only the newest 32 looked at, 19,200 binds over 600 frames held a camera 16 times
-// (2026-11-15), the camera's buffers bound earlier in the frame than those.
-constexpr std::size_t bound_kept = 1024;
+constexpr std::size_t bound_kept = 64;
 std::array<std::atomic<std::uint64_t>, bound_kept> bound_addresses{};
 std::atomic<std::uint64_t> bound_count{};
 
@@ -1013,7 +1011,10 @@ void STDMETHODCALLTYPE hooked_compute_cbv(ID3D12GraphicsCommandList* list, UINT 
 // Its buffer is read through the GPU memory watch (gpu_diagnostics.h). False when there is none.
 bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
     const auto end = bound_count.load();
-    constexpr std::uint64_t looked_most = bound_kept;
+    // The newest 32 only: the camera is no longer where this looks (camera-research, 2026-11-15), so the delayed
+    // camera is used nearly always, and reading every bind of a frame (100 to 200 buffers) cost the render thread
+    // for nothing.
+    constexpr std::uint64_t looked_most = 32;
     const auto begin = std::max(s.bound_seen, end > looked_most ? end - looked_most : std::uint64_t{0});
     s.bound_seen = end;
     s.camera_binds_most = std::max<std::uint64_t>(s.camera_binds_most, end - s.bound_seen_before);
