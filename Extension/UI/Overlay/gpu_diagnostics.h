@@ -32,8 +32,13 @@ void watch_draws(ID3D12GraphicsCommandList* list) noexcept;
 // With RESKATE_GPU_DIAGNOSTICS on, before the game makes its device: every heap and resource the
 // device makes is kept with the code that made it, and the code that freed it once it goes. A
 // page fault's report (record_device_failure) then says what was at, or freed from, the address.
-// Without it, light: each heap and buffer with its GPU addresses only (read_gpu_buffer), not the code.
+// Without it, light (each heap and buffer with its GPU addresses only, for read_gpu_buffer, not the code), and
+// only when a plugin drew a world cover in one of the last few launches; otherwise nothing is hooked.
 void watch_gpu_memory() noexcept;
+// A plugin asked for a world cover (world_cover.h, the first time this launch; in a HookBatch): the next few
+// launches start the light watch with the game's device, and if none is on yet it starts now on `device`, the
+// game's (only buffers made from now on are known to it).
+void watch_gpu_memory_for_cover(ID3D12Device* device) noexcept;
 void describe_gpu_address(std::uint64_t address) noexcept;
 // With the GPU memory watch on: every GPU address the game binds for a draw or dispatch (vertex and
 // index buffers, root buffer views), puts in a constant-buffer or acceleration-structure view, or

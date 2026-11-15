@@ -45,17 +45,16 @@ std::filesystem::path breadcrumbs_note() {
     CoTaskMemFree(local);
     return path;
 }
-int breadcrumbs_left() {
-    const auto path = breadcrumbs_note();
+// A launch count kept in a small file of %LOCALAPPDATA%\ReSkate: how many launches are still to do something.
+int launches_left(const std::filesystem::path& path, int most) {
     int left{};
     if (FILE* file{}; !path.empty() && _wfopen_s(&file, path.c_str(), L"r") == 0 && file) {
         if (fscanf_s(file, "%d", &left) != 1) left = 0;
         std::fclose(file);
     }
-    return std::clamp(left, 0, breadcrumb_launches);
+    return std::clamp(left, 0, most);
 }
-void set_breadcrumbs_left(int left) {
-    const auto path = breadcrumbs_note();
+void set_launches_left(const std::filesystem::path& path, int left) {
     if (path.empty()) return;
     std::error_code error;
     if (left <= 0) {
@@ -67,6 +66,19 @@ void set_breadcrumbs_left(int left) {
         std::fprintf(file, "%d\n", left);
         std::fclose(file);
     }
+}
+int breadcrumbs_left() { return launches_left(breadcrumbs_note(), breadcrumb_launches); }
+void set_breadcrumbs_left(int left) { set_launches_left(breadcrumbs_note(), left); }
+// A plugin's world cover reads the game's camera through the light GPU memory watch, which must be in before the
+// game makes its device to know the game's buffers (D3D12 cannot look a buffer up by its GPU address). So it
+// starts at launch only for a player whose plugins drew a cover in one of the last few launches:
+// %LOCALAPPDATA%\ReSkate\world-cover.txt, how many launches are still to start it. Set again each launch a
+// cover is drawn (watch_gpu_memory_for_cover); a player who has none never has the watch.
+constexpr int cover_launches = 5;
+std::filesystem::path cover_note() {
+    auto path = breadcrumbs_note();
+    if (!path.empty()) path.replace_filename(L"world-cover.txt");
+    return path;
 }
 }
 
@@ -610,7 +622,7 @@ void watch_device_memory(IUnknown* made) noexcept {
     if (!light) on &= watch_device_views(device.Get());
     dingosdk::logging::write(on ? dingosdk::logging::Level::info : dingosdk::logging::Level::warning, dingosdk::logging::Channel::graphics,
         !on ? "GPU diagnostics: some of the GPU memory watch could not start."
-        : light ? "GPU memory watch (light): each GPU heap and buffer's addresses are kept, for the snow to read the game's camera."
+        : light ? "GPU memory watch (light): each GPU heap and buffer's addresses are kept, for a plugin's world cover to read the game's camera."
                 : "GPU diagnostics: the code that makes and frees each GPU heap and resource is kept, for a page fault's report.");
 }
 
@@ -1000,15 +1012,26 @@ void watch_addresses(ID3D12GraphicsCommandList* list) noexcept {
     SetLastError(error);
 }
 
+namespace {
+std::atomic<bool> memory_watch_started{}; // the hook on D3D12CreateDevice is in (watch_gpu_memory)
+}
 void watch_gpu_memory() noexcept {
-    static std::atomic<bool> started{};
     const auto error = GetLastError();
-    if (started.exchange(true)) {
+    // With the diagnostics, all of it. Without, light, and only for a player whose plugins drew a world cover in a
+    // recent launch (cover_note): what the cover needs to read the game's camera. Anyone else has none of it.
+    const bool diagnostics = graphics_option_enabled(L"RESKATE_GPU_DIAGNOSTICS");
+    int cover_left = 0;
+    if (!diagnostics) {
+        try {
+            cover_left = launches_left(cover_note(), cover_launches);
+            if (cover_left > 0) set_launches_left(cover_note(), cover_left - 1);
+        } catch (...) {}
+    }
+    if ((!diagnostics && cover_left <= 0) || memory_watch_started.exchange(true)) {
         SetLastError(error);
         return;
     }
-    // Without the diagnostics, light: only what the snow needs to read the game's camera.
-    light_memory.store(!graphics_option_enabled(L"RESKATE_GPU_DIAGNOSTICS"));
+    light_memory.store(!diagnostics);
     // (d3d12.dll is ReSkate's own import, so it is loaded; the game finds D3D12CreateDevice there.)
     auto* const create = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12CreateDevice"));
     void* trampoline{};
@@ -1027,6 +1050,21 @@ namespace {
 // The starts of buffers read_gpu_buffer could not map (not in a CPU-visible heap): not tried again.
 std::mutex unmappable_mutex;
 std::vector<std::uint64_t> unmappable;
+}
+
+void watch_gpu_memory_for_cover(ID3D12Device* device) noexcept {
+    const auto error = GetLastError();
+    try {
+        static std::atomic<bool> noted{};
+        if (!noted.exchange(true)) set_launches_left(cover_note(), cover_launches);
+        // Not in from the start of this launch (no cover in a recent one): light from now on. The game's buffers made
+        // before now are not known, so its camera may be read only from the next launch.
+        if (device && !memory_watch_started.exchange(true)) {
+            light_memory.store(true);
+            watch_device_memory(device);
+        }
+    } catch (...) {}
+    SetLastError(error);
 }
 
 std::size_t read_gpu_buffer(std::uint64_t address, void* out, std::size_t bytes, std::uint64_t* buffer_start,
