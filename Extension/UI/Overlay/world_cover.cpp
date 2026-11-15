@@ -272,6 +272,8 @@ struct Shared {
     // The cameras of this and the last two frames, newest first, and how many are known.
     std::array<std::array<float, camera_floats>, camera_history> cameras{};
     std::size_t cameras_known{};
+    // The camera each time it changed, and when (now_us), oldest first: the picture's camera is found by time from these.
+    std::deque<std::pair<std::uint64_t, std::array<float, camera_floats>>> camera_changes;
     unsigned cost_frames{}; // frames since the cost was last said
     double frame_us{};             // how long a frame takes, eased (present to present)
     std::uint64_t last_present_us{};
@@ -1109,6 +1111,45 @@ bool record_cover(Shared& s) {
         const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
         if (length > 1e-6f) v[0] /= length, v[1] /= length, v[2] /= length;
     }
+    // By time, where the camera changed often enough to tell: camera_delay frames back from now, between the two
+    // changes either side of that moment. The game moves some cameras only on its update ticks, fewer than the frames
+    // drawn (the free camera an FPV drone mod flies: about 60 a second against 82 frames, 2026-11-15). Counted in
+    // frames, the camera taken was the one drawn with on some frames and a tick away on others: in a fast turn the
+    // ground came out tilted for a frame, and patches of the snow went and came back.
+    {
+        const std::uint64_t now_time = now_us();
+        const auto& newest = s.cameras[0];
+        if (s.camera_changes.empty() || s.camera_changes.back().second != newest) s.camera_changes.emplace_back(now_time, newest);
+        while (s.camera_changes.size() > 2 && s.camera_changes[1].first + 500000 < now_time) s.camera_changes.pop_front();
+        const double frame_time = s.frame_us > 0 ? s.frame_us : 16667.0;
+        const auto back_us = static_cast<std::uint64_t>(camera_delay * frame_time);
+        const std::uint64_t target = now_time > back_us ? now_time - back_us : 0;
+        const auto& changes = s.camera_changes;
+        std::size_t after = 0;
+        while (after < changes.size() && changes[after].first <= target) ++after;
+        // Before the first change kept, the cameras counted in frames stay (a start); after the last, it is the last.
+        if (after > 0) {
+            camera = changes[after - 1].second;
+            if (after < changes.size()) {
+                const auto& [t0, one] = changes[after - 1];
+                const auto& [t1, two] = changes[after];
+                // A camera still for a while was still until shortly before it moved again (it is seen only as frames are
+                // drawn), not moving all the time since: from at most two frames before the change.
+                const auto from = std::max(t0, t1 - std::min(t1, static_cast<std::uint64_t>(2 * frame_time)));
+                // A jump (a cut, a teleport) is not blended through.
+                const float dx = two[9] - one[9], dy = two[10] - one[10], dz = two[11] - one[11];
+                if (target > from && dx * dx + dy * dy + dz * dz < 25.0f) {
+                    const float t = static_cast<float>(static_cast<double>(target - from) / static_cast<double>(t1 - from));
+                    for (std::size_t k = 0; k < camera_floats; ++k) camera[k] += (two[k] - one[k]) * t;
+                    for (std::size_t axis = 0; axis < 3; ++axis) {
+                        float* const v = camera.data() + axis * 3;
+                        const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                        if (length > 1e-6f) v[0] /= length, v[1] /= length, v[2] /= length;
+                    }
+                }
+            }
+        }
+    }
     // (The camera the game drew with was read from its constant buffers for a while, 2026-11-13 to 11-15. The game
     // no longer kept that camera where it was read, and the one found in its place was not the one it drew with:
     // the trails jumped about. The delayed camera alone is steadier, and needs no reading of the game's memory.)
@@ -1843,6 +1884,7 @@ void release() noexcept {
         s.timer_waiting = {};
         s.relearning = false;
         s.cameras_known = 0;
+        s.camera_changes.clear();
         s.nears.clear();
         s.held_near = 0;
         s.shown_near = 0;
