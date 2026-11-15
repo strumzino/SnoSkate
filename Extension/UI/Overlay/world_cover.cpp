@@ -274,6 +274,9 @@ struct Shared {
     // The game's own camera (game_camera): the binds already looked through, and how many frames found it.
     std::uint64_t bound_seen{};
     unsigned game_camera_frames{}, camera_frames{}, camera_reports{};
+    // Where reading it went, over the same 600 frames (said with them): binds looked at, read, holding a camera,
+    // and close to the one read from the game.
+    std::uint64_t camera_binds{}, camera_reads{}, camera_held{}, camera_close{};
     std::array<float, 3> camera_signs{1, 1, 1}; // which way round each of its axes is against ours
     float places_back = camera_delay; // how many frames back the places are taken (the drawn camera's, as found)
     // The places kept clear as each of those frames was drawn, newest first: a place on something that moves
@@ -1005,7 +1008,9 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
     std::array<float, 20> f{};
     for (auto n = end; n > begin; --n) {
         const auto address = bound_addresses[(n - 1) % bound_kept].load(std::memory_order_relaxed);
+        ++s.camera_binds;
         if (!address || overlay::read_gpu_buffer(address, f.data(), sizeof(f)) < sizeof(f)) continue;
+        ++s.camera_reads;
         const float* const rows = f.data() + 4;
         std::array<float, camera_floats> one{};
         bool ok = true;
@@ -1025,6 +1030,7 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
         }
         if (ok) held.push_back(one);
     }
+    s.camera_held += held.size();
     const auto turned = [&](const std::array<float, camera_floats>& one) {
         auto out = one;
         for (std::size_t a = 0; a < 3; ++a)
@@ -1064,6 +1070,7 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
         if (close_ones.empty()) close_signs = signs;
         close_ones.push_back(i);
     }
+    s.camera_close += close_ones.size();
     if (!close_ones.empty()) {
         s.camera_signs = close_signs;
         camera = turned(held[most_held(close_ones).first]);
@@ -1204,9 +1211,13 @@ bool record_cover(Shared& s) {
         if (s.camera_reports < 6) {
             ++s.camera_reports;
             logging::printf(logging::Level::info, logging::Channel::graphics,
-                            "World cover: the game's own camera was read in %u of the last 600 frames (else the one %.2f frames back).",
-                            s.game_camera_frames, camera_delay);
+                            "World cover: the game's own camera was read in %u of the last 600 frames (else the one %.2f frames back); "
+                            "its binds %llu, read %llu, holding a camera %llu, close to ours %llu.",
+                            s.game_camera_frames, camera_delay, static_cast<unsigned long long>(s.camera_binds),
+                            static_cast<unsigned long long>(s.camera_reads), static_cast<unsigned long long>(s.camera_held),
+                            static_cast<unsigned long long>(s.camera_close));
         }
+        s.camera_binds = s.camera_reads = s.camera_held = s.camera_close = 0;
         s.camera_frames = s.game_camera_frames = 0;
         // What it costs: on the GPU a frame, and the roof map's rays on the game's update thread a tick.
         const auto ticks = roof_ticks.exchange(0), rays = roof_rays.exchange(0), roof_us = roof_us_total.exchange(0), roof_most = roof_us_most.exchange(0);

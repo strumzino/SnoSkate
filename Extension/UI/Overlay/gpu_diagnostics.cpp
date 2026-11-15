@@ -307,6 +307,7 @@ struct Memory {
     // read_gpu_buffer finds one in it at once; through the heaps' ranges it went over every resource, and the
     // camera's read each frame stalled the game (2026-11-13).
     std::map<std::uint64_t, std::pair<std::uint64_t, void*>> buffers;
+    std::uint64_t buffer_longest{}; // the most bytes of any buffer in it (how far back one can start and still cover an address)
 };
 Memory& gpu_memory() { static auto* value = new Memory; return *value; }
 
@@ -427,7 +428,10 @@ void note_resource(void** out, void* heap, std::uint64_t offset) noexcept {
             }
         }
         if (!heap) add_range(made);
-        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && made.gpu && made.bytes) m.buffers[made.gpu] = {made.bytes, object};
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && made.gpu && made.bytes) {
+            m.buffers[made.gpu] = {made.bytes, object};
+            m.buffer_longest = std::max(m.buffer_longest, made.bytes);
+        }
         m.live[object] = made;
         ++m.made_count;
     } catch (...) {}
@@ -1071,37 +1075,59 @@ void watch_gpu_memory_for_cover(ID3D12Device* device) noexcept {
 std::size_t read_gpu_buffer(std::uint64_t address, void* out, std::size_t bytes, std::uint64_t* buffer_start,
                             std::uint64_t* buffer_length) noexcept {
     try {
-        // The buffer holding the address, from the memory watch, held for the read.
-        std::uint64_t start{}, length{};
-        ComPtr<ID3D12Resource> resource;
+        // The buffers holding the address, from the memory watch. The game's buffers overlap (smaller ones placed
+        // over the memory of a big one): the one starting nearest below the address can end before it while one
+        // starting further back holds it. Taking only that nearest one, the camera was never read (0 of every 600
+        // frames from 2026-11-14 on). So: the one that held it last time first (the game's camera stays in the
+        // same few buffers), then those starting back from the address, as far back as the longest buffer reaches.
+        static std::atomic<std::uint64_t> last_start{};
+        struct Found {
+            std::uint64_t start{}, length{};
+            ComPtr<ID3D12Resource> resource;
+        };
+        std::vector<Found> found;
         {
             auto& m = gpu_memory();
             std::lock_guard lock(m.mutex);
-            auto at = m.buffers.upper_bound(address);
-            if (at == m.buffers.begin()) return 0;
-            --at;
-            if (address - at->first >= at->second.first) return 0;
-            start = at->first, length = at->second.first;
-            if (FAILED(static_cast<IUnknown*>(at->second.second)->QueryInterface(IID_PPV_ARGS(&resource))) || !resource) return 0;
+            const auto take = [&](std::map<std::uint64_t, std::pair<std::uint64_t, void*>>::const_iterator at) {
+                if (address - at->first >= at->second.first) return;
+                {
+                    std::lock_guard bad(unmappable_mutex);
+                    if (std::find(unmappable.begin(), unmappable.end(), at->first) != unmappable.end()) return;
+                }
+                Found f{at->first, at->second.first, {}};
+                if (SUCCEEDED(static_cast<IUnknown*>(at->second.second)->QueryInterface(IID_PPV_ARGS(&f.resource))) && f.resource)
+                    found.push_back(std::move(f));
+            };
+            if (const auto last = last_start.load(); last)
+                if (const auto at = m.buffers.find(last); at != m.buffers.end()) take(at);
+            if (found.empty()) {
+                auto at = m.buffers.upper_bound(address);
+                for (std::size_t looked = 0; at != m.buffers.begin() && looked < 4096 && found.size() < 4; ++looked) {
+                    --at;
+                    if (address - at->first >= m.buffer_longest) break; // none further back reaches it
+                    take(at);
+                }
+            }
         }
-        {
-            std::lock_guard lock(unmappable_mutex);
-            if (std::find(unmappable.begin(), unmappable.end(), start) != unmappable.end()) return 0;
+        for (const auto& f : found) {
+            void* cpu{};
+            if (FAILED(f.resource->Map(0, nullptr, &cpu)) || !cpu) { // (only a CPU-visible heap maps)
+                std::lock_guard lock(unmappable_mutex);
+                if (unmappable.size() < 4096) unmappable.push_back(f.start);
+                continue;
+            }
+            const auto offset = address - f.start;
+            const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, f.length - offset));
+            std::memcpy(out, static_cast<const char*>(cpu) + offset, n);
+            const D3D12_RANGE written{0, 0};
+            f.resource->Unmap(0, &written);
+            last_start.store(f.start);
+            if (buffer_start) *buffer_start = f.start;
+            if (buffer_length) *buffer_length = f.length;
+            return n;
         }
-        void* cpu{};
-        if (FAILED(resource->Map(0, nullptr, &cpu)) || !cpu) { // (only a CPU-visible heap maps)
-            std::lock_guard lock(unmappable_mutex);
-            if (unmappable.size() < 4096) unmappable.push_back(start);
-            return 0;
-        }
-        const auto offset = address - start;
-        const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, length - offset));
-        std::memcpy(out, static_cast<const char*>(cpu) + offset, n);
-        const D3D12_RANGE written{0, 0};
-        resource->Unmap(0, &written);
-        if (buffer_start) *buffer_start = start;
-        if (buffer_length) *buffer_length = length;
-        return n;
+        return 0;
     } catch (...) {
         return 0;
     }
