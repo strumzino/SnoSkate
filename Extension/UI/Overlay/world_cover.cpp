@@ -5,18 +5,21 @@
 #include "Engine/Core/Log/logging.h"
 #include "Extension/Plugins/plugin_camera.h"
 #include "Extension/UI/Overlay/gpu_diagnostics.h"
+#include <ShlObj.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <mutex>
 #include <map>
 #include <set>
-#include <tuple>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -25,13 +28,11 @@
 
 // world_cover.h says what this does and how it finds its moment in the game's frame.
 namespace dingosdk::world_cover {
-namespace camera_search { void take(int kind, unsigned index, std::uint64_t address) noexcept; } // research, below
 namespace {
 using Microsoft::WRL::ComPtr;
 
 // Slots of the D3D12 interfaces' tables (d3d12.h's declaration order).
-constexpr std::size_t device_create_rtv = 20, device_create_dsv = 21, device_copy_descriptors = 23, device_copy_simple = 24;
-constexpr std::size_t list_set_targets = 46, list_begin_render_pass = 68, queue_execute = 10;
+constexpr std::size_t queue_execute = 10;
 constexpr std::size_t list_compute_root_cbv = 37; // SetComputeRootConstantBufferView
 // world_cover.hlsl's cbuffer: seven float4s of camera and look, then the places kept clear (one float4
 // with their count and heights, three with their feet and radii), then last frame's camera (four). A
@@ -62,9 +63,9 @@ constexpr std::size_t camera_floats = 12; // right, up, back, eye
 // Trails through the cover (add_trail): at most this many points kept (world_cover.hlsl's MOST_TRAIL).
 constexpr std::size_t most_trail = 256;
 // The shaders' buffer (world_cover.hlsl's t3), one part of the upload buffer per command allocator: the
-// cameras (four float4s each), then a float4 a place kept clear (how much snow shows on what stands in
+// cameras (four float4s each), then a float4 a place kept clear (how much of the cover shows on what stands in
 // it), then the trails (two float4s of head, then two a point).
-constexpr std::size_t place_floats4 = 3; // a place kept clear: its snow; a board's forward and half length; its up and half width
+constexpr std::size_t place_floats4 = 3; // a place kept clear: its dusting; a board's forward and half length; its up and half width
 // The roof map (Settings::under_roofs), after the trails: two float4s of head (on, the near grid's cells
 // across and cell size, the far grid's cells across; the far grid's cell size), then the near grid's cells,
 // then the far grid's, a float4 each (the highest surface over its middle, which cell it is: x, z, and 1
@@ -73,18 +74,40 @@ constexpr std::size_t place_floats4 = 3; // a place kept clear: its snow; a boar
 // straight-down ray a cell. The near grid is fine and refreshed often, the far one coarse: one grid 48 m
 // each way showed the snow under a roof go as the camera came near it (2026-11-13).
 struct RoofGrid {
-    int cells;    // across, each way
-    float size;   // a cell, metres
-    int per_tick; // rays a tick
+    int cells;     // across, each way
+    float size;    // a cell, metres
+    int new_tick;  // rays a tick for cells not measured yet, the nearest first
+    int again_tick; // and for measuring the others again, in turn (what changes: little)
 };
+// Measuring every cell over and over took a few hundred rays every tick, standing still too; only the cells
+// new to the window, then a few again a tick, the same once the camera has looked round (2026-11-14).
 constexpr std::array<RoofGrid, 2> roof_grids{{
-    {128, 0.5f, 256},  // 64 m across, in about half a second
-    {128, 1.5f, 128},  // 192 m across (96 m each way), in about two seconds
+    {128, 0.5f, 48, 8},  // 64 m across
+    {128, 1.5f, 24, 4},  // 192 m across (96 m each way)
 }};
+// And at most this long a tick: the rays run on the game's update thread, and on a Steam Deck (Proton) the game
+// ran in slow motion with the snow on (2026-11-14).
+constexpr double roof_tick_budget_ms = 1.0;
+// How long the roof map's rays took (the update thread) and the cover took on the GPU, said every 600 frames.
+std::atomic<std::uint64_t> roof_us_total{}, roof_us_most{}, roof_ticks{}, roof_rays{};
 constexpr std::size_t roof_cells_of(const RoofGrid& g) { return static_cast<std::size_t>(g.cells) * static_cast<std::size_t>(g.cells); }
-constexpr std::size_t roof_floats4 = 2 + roof_cells_of(roof_grids[0]) + roof_cells_of(roof_grids[1]);
+// After the grids: for each block of the near grid's cells (roof_block across), the highest surface over it and
+// the blocks round it (four to a float4): a point under none of those is under no roof, from one read instead of
+// the dozens of the roof's soft edge (world_cover.hlsl, roofed_at). A block is 4 m, so that reaches at least 4 m,
+// past the edge's furthest look (2.2 m, and a cell's blend). Cell by cell within 3.5 m, working it out took up to
+// 9 ms of the game's update thread on a Steam Deck (2026-11-14).
+constexpr int roof_block = 8;
+constexpr int roof_blocks = 128 / roof_block; // across the near grid
+static_assert(roof_grids[0].cells == roof_blocks * roof_block, "the near grid is whole blocks");
+constexpr std::size_t roof_floats4 = 2 + roof_cells_of(roof_grids[0]) + roof_cells_of(roof_grids[1]) + roof_blocks * roof_blocks / 4;
 constexpr float roof_reach = 60.0f; // metres over and under the camera the rays start and end
-constexpr UINT64 camera_slice = ((camera_candidates * 4 + most_clear * place_floats4 + 2 + most_trail * 2 + roof_floats4) * 16 + 255) /
+// After the trail's points, a box a run of trail_run of them (and the one before) lies in on the ground, widened
+// by how far a pixel can be from them and still be on their trail: a pixel reads the points only of the runs
+// whose box it is in. Every pixel in the trails' box read all of them, two float4s a point, and on a Steam Deck
+// the cover took 16 ms a frame on the GPU (2026-11-14).
+constexpr std::size_t trail_run = 8;
+constexpr std::size_t trail_runs = most_trail / trail_run;
+constexpr UINT64 camera_slice = ((camera_candidates * 4 + most_clear * place_floats4 + 2 + most_trail * 2 + trail_runs + roof_floats4) * 16 + 255) /
                                 256 * 256;
 // The measurements: one row a candidate camera, a column a point (ps_measure), read back by the CPU.
 constexpr UINT measure_columns = 32;
@@ -94,20 +117,8 @@ constexpr UINT64 measure_slice = UINT64{measure_pitch} * camera_candidates;
 // behind; with eight a frame now and then found none free and went without the snow (2026-11-11).
 constexpr std::size_t allocator_count = 16;
 
-using CreateViewFn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const void*, D3D12_CPU_DESCRIPTOR_HANDLE);
-using CopyDescriptorsFn = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT,
-                                                   const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
-using CopySimpleFn = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
-using SetTargetsFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
 using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 
-std::atomic<CreateViewFn> original_rtv{}, original_dsv{};
-std::atomic<CopyDescriptorsFn> original_copy{};
-std::atomic<CopySimpleFn> original_copy_simple{};
-std::atomic<SetTargetsFn> original_targets{};
-using RenderPassFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*, UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*,
-                                              const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*, D3D12_RENDER_PASS_FLAGS);
-std::atomic<RenderPassFn> original_render_pass{};
 std::atomic<ExecuteFn> original_execute{};
 // The game's camera, as it drew the frame: the compute constant buffers it binds at root parameter 0, the last
 // bound_kept of them in turn (a count, and the slot each went into). Tried in the game (2026-11-13): these
@@ -117,7 +128,9 @@ std::atomic<ExecuteFn> original_execute{};
 // fixed delay was right only on average and world-fixed things (trails) still moved a little.
 using RootViewFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
 std::atomic<RootViewFn> original_compute_cbv{};
-constexpr std::size_t bound_kept = 64;
+// All of a frame's: with only the newest 32 looked at, 19,200 binds over 600 frames held a camera 16 times
+// (2026-11-15), the camera's buffers bound earlier in the frame than those.
+constexpr std::size_t bound_kept = 1024;
 std::array<std::atomic<std::uint64_t>, bound_kept> bound_addresses{};
 std::atomic<std::uint64_t> bound_count{};
 
@@ -127,12 +140,13 @@ struct Asked {
     Settings settings;
     std::vector<Clear> clear;
     std::uint64_t clear_until{}; // keep_clear holds for 300 ms
-    std::uint64_t stopping_since{}; // when the snowfall began to stop (GetTickCount64), 0 while it falls
+    std::uint64_t stopping_since{}; // when the fall began to stop (GetTickCount64), 0 while it falls
     struct TrailPoint {
         std::array<float, 3> at{};
         float width{}, fade{};
         float tread{}; // the width of a tread pressed into it (its lines), or 0
         bool starts{}; // begins a new trail, not joined to the point before
+        int tread_lines{13}; // the tread's lines across it
         std::uint64_t when{};
     };
     std::deque<TrailPoint> trail;
@@ -140,7 +154,10 @@ struct Asked {
     // camera was last drawn from.
     std::array<std::vector<std::array<float, 4>>, 2> roofs{std::vector<std::array<float, 4>>(roof_cells_of(roof_grids[0])),
                                                            std::vector<std::array<float, 4>>(roof_cells_of(roof_grids[1]))};
-    std::array<std::size_t, 2> roof_next{}; // each grid's next cell of the window round the camera to measure
+    std::array<std::size_t, 2> roof_next{}; // each grid's next cell of the window round the camera to measure again
+    std::vector<float> roof_near_top = std::vector<float>(static_cast<std::size_t>(roof_blocks) * roof_blocks, 1e30f); // (see roof_block)
+    std::array<int, 2> roof_near_first{}; // the near grid's first cell (x, z) when roof_near_top was worked out
+    std::uint64_t roof_version{};        // counted up when any of the roof map changes
     std::array<float, 3> eye{};
     bool eye_known{};
 };
@@ -150,11 +167,6 @@ std::atomic<bool> allowed{};     // the world has been in play for a moment (all
 std::atomic<bool> retired{};     // the game's frame is not one the cover can safely go into
 std::uint64_t playing_since{};   // client thread: when play began, 0 out of play
 
-// A view the game made: what it is of, and in which format.
-struct View {
-    ID3D12Resource* resource{};
-    DXGI_FORMAT format{};
-};
 bool hdr_format(DXGI_FORMAT f) {
     return f == DXGI_FORMAT_R11G11B10_FLOAT || f == DXGI_FORMAT_R16G16B16A16_FLOAT || f == DXGI_FORMAT_R32G32B32A32_FLOAT;
 }
@@ -180,8 +192,6 @@ struct Notes {
 
 struct Shared {
     std::mutex mutex;
-    // The game's render target and depth views, by CPU handle (every heap of the device: one address space).
-    std::unordered_map<SIZE_T, View> rtvs, dsvs;
     std::unordered_map<ID3D12GraphicsCommandList*, Notes> notes;
     ID3D12CommandQueue* queue{};
     ID3D12Device* device{};
@@ -243,6 +253,22 @@ struct Shared {
     // Whether that frame was drawn with its own depth: one drawn with an older copy (the camera moved
     // since) measured the near distance too short, and it was held (0.056 m for 0.060, 2026-11-12).
     std::array<bool, allocator_count> measure_fresh{};
+    // The cover's time on the GPU: a timestamp before and after each allocator's list, read back when it is free.
+    ComPtr<ID3D12QueryHeap> timer_heap;
+    ComPtr<ID3D12Resource> timer_readback;
+    const std::uint64_t* timer_cpu{};
+    std::array<bool, allocator_count> timer_waiting{};
+    UINT64 timer_frequency{};
+    double gpu_ms_total{}, gpu_ms_most{};
+    unsigned gpu_samples{};
+    // Light (world_cover.hlsl): fewer flakes and samples, once the cover has taken over 6 ms a frame on the GPU
+    // (120 frames together), and so for the rest of the session. On a Steam Deck it took 12 to 15 ms, and the
+    // game ran in slow motion; on a desktop card, a fraction of one (2026-11-14).
+    bool light{};
+    double light_ms{};
+    unsigned light_samples{};
+    // The roof map's version in each allocator's part of the upload buffer: copied only when it changed.
+    std::array<std::uint64_t, allocator_count> roof_uploaded{};
     bool relearning{}; // a new camera: the next middle measured is taken, up or down
     // The cameras of this and the last two frames, newest first, and how many are known.
     std::array<std::array<float, camera_floats>, camera_history> cameras{};
@@ -250,8 +276,11 @@ struct Shared {
     // The game's own camera (game_camera): the binds already looked through, and how many frames found it.
     std::uint64_t bound_seen{};
     unsigned game_camera_frames{}, camera_frames{}, camera_reports{};
-    std::array<float, 3> camera_signs{1, 1, 1}; // which way round each of its axes is against ours, once learnt
-    bool camera_signs_known{};
+    // Where reading it went, over the same 600 frames (said with them): binds looked at, read, holding a camera,
+    // and close to the one read from the game.
+    std::uint64_t camera_binds{}, camera_distinct{}, camera_reads{}, camera_held{}, camera_close{};
+    std::uint64_t camera_binds_most{}, bound_seen_before{}; // the most binds in one frame
+    std::array<float, 3> camera_signs{1, 1, 1}; // which way round each of its axes is against ours
     float places_back = camera_delay; // how many frames back the places are taken (the drawn camera's, as found)
     // The places kept clear as each of those frames was drawn, newest first: a place on something that moves
     // (a deck) is drawn where the picture has it, camera_delay back, like the world.
@@ -260,7 +289,7 @@ struct Shared {
     std::deque<float> nears;
     float held_near{};
     float shown_near{}; // what the shader is given: held_near, eased into over half a second
-    double fallen{}; // how far the snow has fallen, in seconds at the usual speed (each moment at its own speed)
+    double fallen{}; // how far the flakes have fallen, in seconds at the usual speed (each moment at its own speed)
     std::uint64_t fallen_at{};
     std::uint64_t shown_near_at{};
     unsigned near_disagreed{}; // frames in a row far from held_near
@@ -271,9 +300,8 @@ struct Shared {
     std::uint8_t* camera_cpu{};
     ComPtr<ID3D12Fence> fence;
     UINT64 fence_value{};
-    bool failed{}, said_drawn{}, said_late{}, said_depth{}, said_colour{}, said_waiting{}, said_target{};
+    bool failed{}, said_drawn{}, said_late{}, said_depth{}, said_waiting{}, said_target{};
     unsigned presents_wanted{}; // presents while the cover was wanted and allowed (for the log)
-    std::set<std::string> bindings_said; // what the game binds with the world's depth, said once each
     std::set<ID3D12Resource*> pictures_said; // full-size float pictures seen written, said once each
     // The game writes more than one full-size float picture a frame. Drawing into whichever came last
     // before the cover's moment made it flicker (2026-11-10), so it locks onto one: the picture written
@@ -298,13 +326,11 @@ struct Shared {
 };
 Shared& shared() { static auto* value = new Shared; return *value; }
 
-// The main depth buffer's handles, readable without the lock by the OMSetRenderTargets hook, which
-// runs thousands of times a frame: the common case (another depth, or none) leaves at once.
-std::array<std::atomic<SIZE_T>, 8> depth_handles{};
-std::atomic<std::size_t> next_depth_handle{};
 std::atomic<ID3D12Resource*> main_depth_now{};
 std::atomic<ID3D12Resource*> colour_now{};
 std::atomic<bool> active{}; // wanted, and installed
+// The tables of the runtime's command queues and lists (the overlay's own), where ensure_hooks puts the hooks.
+std::atomic<void**> queue_table{}, list_table{};
 // Our own command list: its barriers go through the same hook as the game's and are not the game's.
 std::atomic<ID3D12GraphicsCommandList*> our_list{};
 
@@ -315,78 +341,7 @@ void say_failed(const std::string& why) {
     logging::write(logging::Level::warning, logging::Channel::graphics, "World cover unavailable: " + why);
 }
 
-void remember_depth_handle(SIZE_T handle) {
-    for (const auto& known : depth_handles)
-        if (known.load(std::memory_order_relaxed) == handle) return;
-    depth_handles[next_depth_handle.fetch_add(1) % depth_handles.size()].store(handle);
-}
-bool is_depth_handle(SIZE_T handle) {
-    for (const auto& known : depth_handles)
-        if (known.load(std::memory_order_relaxed) == handle) return true;
-    return false;
-}
-
 // ---- hooks ------------------------------------------------------------------------------------------
-void STDMETHODCALLTYPE hooked_rtv(ID3D12Device* device, ID3D12Resource* resource, const void* description, D3D12_CPU_DESCRIPTOR_HANDLE at) {
-    original_rtv.load()(device, resource, description, at);
-    try {
-        View view{resource, DXGI_FORMAT_UNKNOWN};
-        if (description) view.format = static_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(description)->Format;
-        else if (resource) view.format = resource->GetDesc().Format;
-        auto& s = shared();
-        std::lock_guard lock(s.mutex);
-        s.rtvs[at.ptr] = view;
-    } catch (...) {}
-}
-void STDMETHODCALLTYPE hooked_dsv(ID3D12Device* device, ID3D12Resource* resource, const void* description, D3D12_CPU_DESCRIPTOR_HANDLE at) {
-    original_dsv.load()(device, resource, description, at);
-    try {
-        auto& s = shared();
-        std::lock_guard lock(s.mutex);
-        s.dsvs[at.ptr] = {resource, DXGI_FORMAT_UNKNOWN};
-        if (resource && resource == main_depth_now.load()) remember_depth_handle(at.ptr);
-    } catch (...) {}
-}
-// Views copied from one heap to another keep what they are of.
-void copy_views(D3D12_DESCRIPTOR_HEAP_TYPE type, SIZE_T to, SIZE_T from, UINT count, UINT increment) {
-    if (type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && type != D3D12_DESCRIPTOR_HEAP_TYPE_DSV) return;
-    auto& s = shared();
-    std::lock_guard lock(s.mutex);
-    auto& map = type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ? s.rtvs : s.dsvs;
-    for (UINT i = 0; i < count; ++i) {
-        const auto found = map.find(from + SIZE_T{i} * increment);
-        if (found == map.end()) map.erase(to + SIZE_T{i} * increment);
-        else {
-            map[to + SIZE_T{i} * increment] = found->second;
-            if (type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV && found->second.resource && found->second.resource == main_depth_now.load())
-                remember_depth_handle(to + SIZE_T{i} * increment);
-        }
-    }
-}
-void STDMETHODCALLTYPE hooked_copy_simple(ID3D12Device* device, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE to, D3D12_CPU_DESCRIPTOR_HANDLE from,
-                                          D3D12_DESCRIPTOR_HEAP_TYPE type) {
-    original_copy_simple.load()(device, count, to, from, type);
-    try {
-        copy_views(type, to.ptr, from.ptr, count, device->GetDescriptorHandleIncrementSize(type));
-    } catch (...) {}
-}
-void STDMETHODCALLTYPE hooked_copy(ID3D12Device* device, UINT to_count, const D3D12_CPU_DESCRIPTOR_HANDLE* to_starts, const UINT* to_sizes, UINT from_count,
-                                   const D3D12_CPU_DESCRIPTOR_HANDLE* from_starts, const UINT* from_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
-    original_copy.load()(device, to_count, to_starts, to_sizes, from_count, from_starts, from_sizes, type);
-    if (type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && type != D3D12_DESCRIPTOR_HEAP_TYPE_DSV) return;
-    try {
-        // Both sides are runs of descriptors; walk them together, one descriptor at a time.
-        const UINT increment = device->GetDescriptorHandleIncrementSize(type);
-        UINT ti = 0, fi = 0, to_at = 0, from_at = 0;
-        while (ti < to_count && fi < from_count) {
-            const UINT to_size = to_sizes ? to_sizes[ti] : 1, from_size = from_sizes ? from_sizes[fi] : 1;
-            copy_views(type, to_starts[ti].ptr + SIZE_T{to_at} * increment, from_starts[fi].ptr + SIZE_T{from_at} * increment, 1, increment);
-            if (++to_at >= to_size) ++ti, to_at = 0;
-            if (++from_at >= from_size) ++fi, from_at = 0;
-        }
-    } catch (...) {}
-}
-
 // A floating-point colour format a view of this format reads as, or UNKNOWN: a typeless view takes
 // its family's float format.
 DXGI_FORMAT hdr_view_format(DXGI_FORMAT f) {
@@ -394,63 +349,6 @@ DXGI_FORMAT hdr_view_format(DXGI_FORMAT f) {
     if (f == DXGI_FORMAT_R16G16B16A16_TYPELESS) return DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (f == DXGI_FORMAT_R32G32B32A32_TYPELESS) return DXGI_FORMAT_R32G32B32A32_FLOAT;
     return DXGI_FORMAT_UNKNOWN;
-}
-
-// Targets bound with the world's depth (OMSetRenderTargets or BeginRenderPass): the first colour target,
-// if it is a floating-point picture the depth's size, is the world's picture.
-void note_targets(ID3D12GraphicsCommandList* list, UINT count, SIZE_T first_colour, const char* how) {
-    auto& s = shared();
-    std::lock_guard lock(s.mutex);
-    const View* view{};
-    if (count) {
-        const auto found = s.rtvs.find(first_colour);
-        if (found != s.rtvs.end() && found->second.resource) view = &found->second;
-    }
-    D3D12_RESOURCE_DESC desc{};
-    if (view) desc = view->resource->GetDesc();
-    const DXGI_FORMAT format = view ? hdr_view_format(view->format != DXGI_FORMAT_UNKNOWN ? view->format : desc.Format) : DXGI_FORMAT_UNKNOWN;
-    const bool fits = view && format != DXGI_FORMAT_UNKNOWN && desc.Width == s.depth_width && desc.Height == s.depth_height &&
-                      desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 && desc.DepthOrArraySize == 1;
-    // What the game binds with the world's depth, each kind said once (at most 12), while no picture is found.
-    if (!s.said_colour && s.bindings_said.size() < 12) {
-        const std::string kind = !count ? std::format("{}: depth only", how)
-                                 : !view ? std::format("{}: {} target(s), the first a view not known", how, count)
-                                         : std::format("{}: {} target(s), the first {}x{} in view format {} (resource format {})", how, count, desc.Width,
-                                                       desc.Height, static_cast<unsigned>(view->format), static_cast<unsigned>(desc.Format));
-        if (s.bindings_said.insert(kind).second)
-            logging::write(logging::Level::debug, logging::Channel::graphics, "World cover: with the world's depth, " + kind + ".");
-    }
-    if (!fits || s.locked) return;
-    auto& n = s.notes[list];
-    n.world = true;
-    n.colour = view->resource;
-    n.colour_state_known = true; // bound as a target: in RENDER_TARGET now
-    n.colour_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    s.colour_format = format;
-    if (!s.said_colour) {
-        s.said_colour = true;
-        logging::printf(logging::Level::info, logging::Channel::graphics, "World cover: the world's picture is %llux%u, format %u, %u mip level(s) (%s).",
-                        static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<unsigned>(format), static_cast<unsigned>(desc.MipLevels), how);
-    }
-    colour_now.store(n.colour);
-}
-
-void STDMETHODCALLTYPE hooked_targets(ID3D12GraphicsCommandList* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* colours, BOOL single_range,
-                                      const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
-    original_targets.load()(list, count, colours, single_range, depth);
-    if (!active.load(std::memory_order_relaxed) || !depth || !is_depth_handle(depth->ptr)) return;
-    try {
-        note_targets(list, colours ? count : 0, count && colours ? colours[0].ptr : 0, "OMSetRenderTargets");
-    } catch (...) {}
-}
-
-void STDMETHODCALLTYPE hooked_render_pass(ID3D12GraphicsCommandList4* list, UINT count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* colours,
-                                          const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth, D3D12_RENDER_PASS_FLAGS flags) {
-    original_render_pass.load()(list, count, colours, depth, flags);
-    if (!active.load(std::memory_order_relaxed) || !depth || !is_depth_handle(depth->cpuDescriptor.ptr)) return;
-    try {
-        note_targets(list, colours ? count : 0, count && colours ? colours[0].cpuDescriptor.ptr : 0, "BeginRenderPass");
-    } catch (...) {}
 }
 
 bool record_cover(Shared& s);
@@ -467,12 +365,6 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             lock.unlock();
             return original(queue, count, lists);
         }
-        bool world_here = false;
-        for (UINT i = 0; i < count; ++i) {
-            const auto found = s.notes.find(static_cast<ID3D12GraphicsCommandList*>(lists[i]));
-            if (found != s.notes.end() && found->second.world) world_here = true;
-        }
-        (void)world_here;
         // The frame's last batch, which puts the finished scene on the screen with the UI (a layer of its
         // own): the cover goes into the scene's picture just before it, in a list of ours. The game draws
         // almost a whole frame in one command list, so this is the first place after the scene is done
@@ -492,7 +384,6 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             s.colour_format = s.chosen_format;
             s.why = s.unsafe ? "a split or aliasing barrier, or another queue" : s.depth_elsewhere ? "the depth moved on another queue"
                   : composite->final_format != s.chosen_format ? "the final picture in another format" : nullptr;
-            camera_search::take(-1, 0, 0); // research: where in the frame's binds the snow is recorded
             const bool drew = !s.why && record_cover(s);
             if (drew) {
                 s.drawn = true;
@@ -602,6 +493,91 @@ struct Compiled {
     std::atomic<int> state{}; // 0 not started, 1 compiling, 2 ready, 3 failed
 };
 Compiled& compiled() { static auto* value = new Compiled; return *value; }
+// The compiled shaders kept on disk, so a launch after the first loads them instead of compiling again: the
+// compile took 20 to 30 s on a desktop (2026-11-15), and the cover waited for it every launch. Kept as
+// %LOCALAPPDATA%\ReSkate\shader-cache\world-cover-<hash of the shader source and entries>.bin: each entry's
+// name and bytecode. A changed shader has another name; the old file is removed when the new one is written.
+constexpr std::pair<const char*, const char*> shader_entries[]{{"vs_main", "vs_5_0"}, {"ps_main", "ps_5_0"}, {"ps_measure", "ps_5_0"},
+                                                               {"ps_depth", "ps_5_0"}};
+std::filesystem::path shader_cache_folder() {
+    PWSTR local{};
+    std::filesystem::path path;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DONT_VERIFY, nullptr, &local)))
+        path = std::filesystem::path(local) / L"ReSkate" / L"shader-cache";
+    CoTaskMemFree(local);
+    return path;
+}
+std::filesystem::path shader_cache_file() {
+    const auto folder = shader_cache_folder();
+    if (folder.empty()) return {};
+    std::uint64_t hash = 14695981039346656037ULL; // FNV-1a
+    const auto mix = [&](const char* text) {
+        for (const char* c = text; *c; ++c) hash = (hash ^ static_cast<unsigned char>(*c)) * 1099511628211ULL;
+        hash = (hash ^ 0xffU) * 1099511628211ULL;
+    };
+    mix(world_cover_hlsl);
+    for (const auto& [entry, target] : shader_entries) mix(entry), mix(target);
+    return folder / std::format(L"world-cover-{:016x}.bin", hash);
+}
+// Every entry's bytecode from the cache file, or false (none, or not whole).
+bool load_shader_cache(const std::filesystem::path& path, std::map<std::string, ComPtr<ID3DBlob>>& blobs) {
+    if (path.empty()) return false;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::map<std::string, ComPtr<ID3DBlob>> found;
+    for (std::size_t n = 0; n < std::size(shader_entries); ++n) {
+        std::uint32_t name_size{}, size{};
+        if (!in.read(reinterpret_cast<char*>(&name_size), sizeof(name_size)) || name_size == 0 || name_size > 64) return false;
+        std::string name(name_size, '\0');
+        if (!in.read(name.data(), name_size) || !in.read(reinterpret_cast<char*>(&size), sizeof(size)) || size == 0 || size > (16U << 20)) return false;
+        ComPtr<ID3DBlob> blob;
+        if (FAILED(D3DCreateBlob(size, &blob)) || !blob || !in.read(static_cast<char*>(blob->GetBufferPointer()), size)) return false;
+        found[name] = blob;
+    }
+    for (const auto& entry : shader_entries)
+        if (!found.contains(entry.first)) return false;
+    blobs = std::move(found);
+    return true;
+}
+void save_shader_cache(const std::filesystem::path& path, const std::map<std::string, ComPtr<ID3DBlob>>& blobs) {
+    if (path.empty()) return;
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    // Older shaders' files go.
+    for (const auto& item : std::filesystem::directory_iterator(path.parent_path(), error)) {
+        const auto name = item.path().filename().wstring();
+        if (name.starts_with(L"world-cover-") && item.path() != path) std::filesystem::remove(item.path(), error);
+    }
+    const auto partial = std::filesystem::path(path).concat(L".partial");
+    {
+        std::ofstream out(partial, std::ios::binary | std::ios::trunc);
+        if (!out) return;
+        for (const auto& [name, blob] : blobs) {
+            const auto name_size = static_cast<std::uint32_t>(name.size());
+            const auto size = static_cast<std::uint32_t>(blob->GetBufferSize());
+            out.write(reinterpret_cast<const char*>(&name_size), sizeof(name_size));
+            out.write(name.data(), name_size);
+            out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+            out.write(static_cast<const char*>(blob->GetBufferPointer()), size);
+        }
+        if (!out) {
+            out.close();
+            std::filesystem::remove(partial, error);
+            return;
+        }
+    }
+    std::filesystem::rename(partial, path, error);
+    if (error) std::filesystem::remove(partial, error);
+}
+bool has_shader_cache() {
+    try {
+        std::error_code error;
+        const auto path = shader_cache_file();
+        return !path.empty() && std::filesystem::exists(path, error);
+    } catch (...) {
+        return false;
+    }
+}
 void start_compiling() {
     auto& c = compiled();
     int idle = 0;
@@ -609,11 +585,25 @@ void start_compiling() {
     try {
         std::thread([] {
             auto& done = compiled();
-            const auto length = std::strlen(world_cover_hlsl);
             const auto started = GetTickCount64();
-            const std::pair<const char*, const char*> entries[]{{"vs_main", "vs_5_0"}, {"ps_main", "ps_5_0"}, {"ps_measure", "ps_5_0"},
-                                                                {"ps_depth", "ps_5_0"}};
-            for (const auto& [entry, target] : entries) {
+            std::filesystem::path cache;
+            try {
+                cache = shader_cache_file();
+                std::map<std::string, ComPtr<ID3DBlob>> cached;
+                if (load_shader_cache(cache, cached)) {
+                    {
+                        std::lock_guard lock(done.mutex);
+                        done.blobs = std::move(cached);
+                    }
+                    done.state.store(2);
+                    logging::printf(logging::Level::info, logging::Channel::graphics, "World cover: its shaders were loaded from the cache in %.2f s.",
+                                    static_cast<double>(GetTickCount64() - started) / 1000.0);
+                    return;
+                }
+            } catch (...) {}
+            const auto length = std::strlen(world_cover_hlsl);
+            std::map<std::string, ComPtr<ID3DBlob>> made;
+            for (const auto& [entry, target] : shader_entries) {
                 ComPtr<ID3DBlob> blob, error;
                 if (FAILED(D3DCompile(world_cover_hlsl, length, "world_cover", nullptr, nullptr, entry, target, 0, 0, &blob, &error)) || !blob) {
                     std::lock_guard lock(done.mutex);
@@ -621,12 +611,18 @@ void start_compiling() {
                     done.state.store(3);
                     return;
                 }
+                made[entry] = blob;
+            }
+            {
                 std::lock_guard lock(done.mutex);
-                done.blobs[entry] = blob;
+                done.blobs = made;
             }
             done.state.store(2);
             logging::printf(logging::Level::info, logging::Channel::graphics, "World cover: its shaders compiled in %.1f s, apart from the game's drawing.",
                             static_cast<double>(GetTickCount64() - started) / 1000.0);
+            try {
+                save_shader_cache(cache, made);
+            } catch (...) {}
         }).detach();
     } catch (...) {
         c.state.store(0);
@@ -778,6 +774,29 @@ bool build_list(Shared& s) {
         }
         s.measure_cpu = static_cast<const std::uint8_t*>(read);
     }
+    // Timestamps for the cover's time on the GPU (only said in the log; none, and it is still drawn).
+    if (!s.timer_heap && s.queue && SUCCEEDED(s.queue->GetTimestampFrequency(&s.timer_frequency)) && s.timer_frequency) {
+        D3D12_QUERY_HEAP_DESC queries{};
+        queries.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        queries.Count = static_cast<UINT>(allocator_count * 2);
+        D3D12_HEAP_PROPERTIES readback{};
+        readback.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bytes{};
+        bytes.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bytes.Width = allocator_count * 2 * sizeof(std::uint64_t);
+        bytes.Height = 1, bytes.DepthOrArraySize = 1, bytes.MipLevels = 1, bytes.SampleDesc.Count = 1;
+        bytes.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        void* read{};
+        if (FAILED(s.device->CreateQueryHeap(&queries, IID_PPV_ARGS(&s.timer_heap))) ||
+            FAILED(s.device->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &bytes, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&s.timer_readback))) ||
+            FAILED(s.timer_readback->Map(0, nullptr, &read)) || !read) {
+            s.timer_heap.Reset();
+            s.timer_readback.Reset();
+        } else {
+            s.timer_cpu = static_cast<const std::uint64_t*>(read);
+        }
+    }
     return true;
 }
 
@@ -891,7 +910,7 @@ bool snapshot_depth(Shared& s, ID3D12CommandQueue* queue, ExecuteFn original) {
     target_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     auto target = s.targets->GetCPUDescriptorHandleForHeapStart();
     target.ptr += SIZE_T{s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)} * 3;
-    original_rtv.load()(s.device, s.depth_copy.Get(), &target_view, target); // not through our hook: it takes the lock held here
+    s.device->CreateRenderTargetView(s.depth_copy.Get(), &target_view, target);
 
     auto* list = s.list.Get();
     transition(list, s.depth_copy.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -984,25 +1003,32 @@ void STDMETHODCALLTYPE hooked_compute_cbv(ID3D12GraphicsCommandList* list, UINT 
 }
 
 // The camera the game drew this frame with, from the compute constant buffers bound since the last frame
-// (the newest 16): those that hold a camera, unit axes as rows from 16 bytes in, where it is in the fourth row.
-//  1. Of those close to `camera` (the one read from the game, delayed: within about 14 degrees and 2 m), the
-//     one most of them hold, the newest of any as many. A frame's buffers hold two or three cameras a little
-//     apart (the game easing its camera between updates); the newest close one was now one, now another, and
-//     the trails jiggled as the camera moved (2026-11-14). Which way round each of its axes is against ours is
-//     learnt from it.
-//  2. Else, once those ways round are known, the one most of them hold, if two or more do: in the replay
-//     editor the camera read from the game is not the one it draws with, and the trails swam (2026-11-14).
+// (the newest 32): those that hold a camera, unit axes as rows from 16 bytes in, where it is in the fourth row.
+// Of those close to `camera` (the one read from the game, delayed: within about 14 degrees and 2 m), the one
+// most of them hold, the newest of any as many: a frame's buffers hold two or three cameras a little apart
+// (the game easing its camera between updates), and with the newest close one, now one, now another, the
+// trails jiggled as the camera moved (2026-11-14). Each axis is taken the way round `camera` has it. (In the
+// replay editor, whose camera read from the game is not the one it draws with, none is close: the trails
+// there were not helped by taking the one most held, 2026-11-14.)
 // Its buffer is read through the GPU memory watch (gpu_diagnostics.h). False when there is none.
 bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
     const auto end = bound_count.load();
-    constexpr std::uint64_t looked_most = 32;
+    constexpr std::uint64_t looked_most = bound_kept;
     const auto begin = std::max(s.bound_seen, end > looked_most ? end - looked_most : std::uint64_t{0});
     s.bound_seen = end;
+    s.camera_binds_most = std::max<std::uint64_t>(s.camera_binds_most, end - s.bound_seen_before);
+    s.bound_seen_before = end;
     std::vector<std::array<float, camera_floats>> held; // as the buffers have them, newest first
+    std::vector<std::uint64_t> looked; // each address once a frame (the game binds one buffer for many dispatches)
     std::array<float, 20> f{};
     for (auto n = end; n > begin; --n) {
         const auto address = bound_addresses[(n - 1) % bound_kept].load(std::memory_order_relaxed);
-        if (!address || overlay::read_gpu_buffer(address, f.data(), sizeof(f)) < sizeof(f)) continue;
+        ++s.camera_binds;
+        if (!address || std::find(looked.begin(), looked.end(), address) != looked.end()) continue;
+        looked.push_back(address);
+        ++s.camera_distinct;
+        if (overlay::read_gpu_buffer(address, f.data(), sizeof(f)) < sizeof(f)) continue;
+        ++s.camera_reads;
         const float* const rows = f.data() + 4;
         std::array<float, camera_floats> one{};
         bool ok = true;
@@ -1022,6 +1048,7 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
         }
         if (ok) held.push_back(one);
     }
+    s.camera_held += held.size();
     const auto turned = [&](const std::array<float, camera_floats>& one) {
         auto out = one;
         for (std::size_t a = 0; a < 3; ++a)
@@ -1043,7 +1070,7 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
         }
         return std::pair{best, best_count};
     };
-    // 1. Close to the camera read from the game.
+    // Those close to the camera read from the game.
     std::vector<std::size_t> close_ones;
     std::array<float, 3> close_signs{};
     for (std::size_t i = 0; i < held.size(); ++i) {
@@ -1061,20 +1088,13 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
         if (close_ones.empty()) close_signs = signs;
         close_ones.push_back(i);
     }
+    s.camera_close += close_ones.size();
     if (!close_ones.empty()) {
         s.camera_signs = close_signs;
-        s.camera_signs_known = true;
         camera = turned(held[most_held(close_ones).first]);
         return true;
     }
-    // 2. The one most of them hold.
-    if (!s.camera_signs_known || held.size() < 2) return false;
-    std::vector<std::size_t> all(held.size());
-    for (std::size_t i = 0; i < all.size(); ++i) all[i] = i;
-    const auto [best, best_count] = most_held(all);
-    if (best_count < 2) return false;
-    camera = turned(held[best]);
-    return true;
+    return false;
 }
 
 // How many frames back the camera the game drew with is among those read from the game (blended between the
@@ -1155,8 +1175,28 @@ bool record_cover(Shared& s) {
     // What this allocator's last list measured: the GPU is done with it.
     if (s.measure_waiting[at] && s.measure_fresh[at] && s.measure_cpu) take_measurements(s, s.measure_cpu + at * measure_slice);
     s.measure_waiting[at] = false;
+    // And how long its cover took on the GPU.
+    if (s.timer_waiting[at] && s.timer_cpu && s.timer_frequency) {
+        const auto start = s.timer_cpu[at * 2], end = s.timer_cpu[at * 2 + 1];
+        if (end > start) {
+            const double ms = static_cast<double>(end - start) * 1000.0 / static_cast<double>(s.timer_frequency);
+            s.gpu_ms_total += ms, s.gpu_ms_most = std::max(s.gpu_ms_most, ms), ++s.gpu_samples;
+            s.light_ms += ms;
+            if (++s.light_samples >= 120) {
+                const double average = s.light_ms / s.light_samples;
+                if (!s.light && average > 6.0) {
+                    s.light = true;
+                    logging::printf(logging::Level::info, logging::Channel::graphics,
+                                    "World cover: light from now on (it took %.1f ms a frame on the GPU): fewer flakes and samples.", average);
+                }
+                s.light_ms = 0, s.light_samples = 0;
+            }
+        }
+    }
+    s.timer_waiting[at] = false;
     s.why = "recording failed";
     if (FAILED(s.allocators[at]->Reset()) || FAILED(s.list->Reset(s.allocators[at].Get(), nullptr))) return false;
+    if (s.timer_heap) s.list->EndQuery(s.timer_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(at * 2));
     s.next_allocator = (at + 1) % s.allocators.size();
     // This frame's camera, newest first (the measurements try the first camera_candidates of them).
     {
@@ -1189,16 +1229,30 @@ bool record_cover(Shared& s) {
         if (s.camera_reports < 6) {
             ++s.camera_reports;
             logging::printf(logging::Level::info, logging::Channel::graphics,
-                            "World cover: the game's own camera was read in %u of the last 600 frames (else the one %.2f frames back).",
-                            s.game_camera_frames, camera_delay);
+                            "World cover: the game's own camera was read in %u of the last 600 frames (else the one %.2f frames back); "
+                            "its binds %llu (at most %llu a frame), different %llu, read %llu, holding a camera %llu, close to ours %llu.",
+                            s.game_camera_frames, camera_delay, static_cast<unsigned long long>(s.camera_binds),
+                            static_cast<unsigned long long>(s.camera_binds_most), static_cast<unsigned long long>(s.camera_distinct),
+                            static_cast<unsigned long long>(s.camera_reads), static_cast<unsigned long long>(s.camera_held),
+                            static_cast<unsigned long long>(s.camera_close));
         }
+        s.camera_binds = s.camera_distinct = s.camera_reads = s.camera_held = s.camera_close = s.camera_binds_most = 0;
         s.camera_frames = s.game_camera_frames = 0;
+        // What it costs: on the GPU a frame, and the roof map's rays on the game's update thread a tick.
+        const auto ticks = roof_ticks.exchange(0), rays = roof_rays.exchange(0), roof_us = roof_us_total.exchange(0), roof_most = roof_us_most.exchange(0);
+        logging::printf(logging::Level::info, logging::Channel::graphics,
+                        "World cover cost: on the GPU %.2f ms a frame (at most %.2f) over %u frames; the roof map %.2f ms a tick (at most %.2f), %.1f rays a tick, over %llu ticks.",
+                        s.gpu_samples ? s.gpu_ms_total / s.gpu_samples : 0.0, s.gpu_ms_most, s.gpu_samples,
+                        ticks ? static_cast<double>(roof_us) / 1000.0 / static_cast<double>(ticks) : 0.0, static_cast<double>(roof_most) / 1000.0,
+                        ticks ? static_cast<double>(rays) / static_cast<double>(ticks) : 0.0, static_cast<unsigned long long>(ticks));
+        s.gpu_ms_total = s.gpu_ms_most = 0;
+        s.gpu_samples = 0;
     }
 
     Settings settings;
     std::vector<Clear> clear;
     const std::uint64_t now = GetTickCount64();
-    float stopping_seconds = -1; // how long the snowfall has been stopping, or -1 while it falls
+    float stopping_seconds = -1; // how long the fall has been stopping, or -1 while it falls
     {
         auto& a = asked();
         std::lock_guard lock(a.mutex);
@@ -1211,25 +1265,48 @@ bool record_cover(Shared& s) {
         float* const head = reinterpret_cast<float*>(s.camera_cpu + at * camera_slice) + (camera_candidates * 4 + most_clear * place_floats4) * 4;
         std::size_t count = 0;
         std::array<float, 6> box{1e30f, 1e30f, -1e30f, -1e30f, 1e30f, -1e30f}; // min x, min z, max x, max z, min y, max y
+        std::array<std::array<float, 3>, most_trail> flat{}; // each point's x, z and reach, for the runs' boxes (the upload
+                                                            // buffer is slow to read back)
         for (const auto& t : a.trail) {
+            if (count < most_trail) flat[count] = {t.at[0], t.at[2], t.width * 0.5f + 0.5f};
             const float strength = 1.0f - static_cast<float>(now - t.when) / (t.fade * 1000.0f);
             float* const point = head + 8 + count * 8;
             point[0] = t.at[0], point[1] = t.at[1], point[2] = t.at[2], point[3] = t.width;
-            point[4] = std::clamp(strength, 0.0f, 1.0f), point[5] = t.tread, point[6] = t.starts ? 1.0f : 0.0f, point[7] = 0;
+            point[4] = std::clamp(strength, 0.0f, 1.0f), point[5] = t.tread, point[6] = t.starts ? 1.0f : 0.0f,
+            point[7] = static_cast<float>(t.tread_lines);
             box = {std::min(box[0], t.at[0]), std::min(box[1], t.at[2]), std::max(box[2], t.at[0]), std::max(box[3], t.at[2]),
                    std::min(box[4], t.at[1]), std::max(box[5], t.at[1])};
             ++count;
         }
         head[0] = static_cast<float>(count), head[1] = box[0], head[2] = box[1], head[3] = box[2];
         head[4] = box[3], head[5] = box[4], head[6] = box[5], head[7] = 0;
+        // Each run's box: its points and the one before (its first stretch's start), widened as the shader's
+        // nearness test is (half the width, and half a metre). An empty run's box is the wrong way round.
+        float* const runs = head + 8 + most_trail * 8;
+        for (std::size_t r = 0; r < trail_runs; ++r) {
+            std::array<float, 4> run{1e30f, 1e30f, -1e30f, -1e30f};
+            const std::size_t from = r * trail_run > 0 ? r * trail_run - 1 : 0, to = std::min((r + 1) * trail_run, count);
+            for (std::size_t i = from; i < to; ++i) {
+                const auto& [x, z, reach] = flat[i];
+                run = {std::min(run[0], x - reach), std::min(run[1], z - reach), std::max(run[2], x + reach), std::max(run[3], z + reach)};
+            }
+            std::copy(run.begin(), run.end(), runs + r * 4);
+        }
         // The roof map, after the trails (measure_roofs fills it), and where it is measured round.
-        float* const roof = head + 8 + most_trail * 8;
+        float* const roof = runs + trail_runs * 4;
         roof[0] = settings.under_roofs ? 0.0f : 1.0f;
         roof[1] = static_cast<float>(roof_grids[0].cells), roof[2] = roof_grids[0].size, roof[3] = static_cast<float>(roof_grids[1].cells);
-        roof[4] = roof_grids[1].size, roof[5] = roof[6] = roof[7] = 0;
-        if (!settings.under_roofs) {
-            std::memcpy(roof + 8, a.roofs[0].data(), a.roofs[0].size() * sizeof(a.roofs[0][0]));
-            std::memcpy(roof + 8 + a.roofs[0].size() * 4, a.roofs[1].data(), a.roofs[1].size() * sizeof(a.roofs[1][0]));
+        roof[4] = roof_grids[1].size, roof[5] = static_cast<float>(a.roof_near_first[0]), roof[6] = static_cast<float>(a.roof_near_first[1]);
+        roof[7] = 0;
+        // (Its version and one: a part never written holds whatever the buffer had, so it is written once.)
+        if (!settings.under_roofs && s.roof_uploaded[at] != a.roof_version + 1) {
+            s.roof_uploaded[at] = a.roof_version + 1;
+            float* to = roof + 8;
+            std::memcpy(to, a.roofs[0].data(), a.roofs[0].size() * sizeof(a.roofs[0][0]));
+            to += a.roofs[0].size() * 4;
+            std::memcpy(to, a.roofs[1].data(), a.roofs[1].size() * sizeof(a.roofs[1][0]));
+            to += a.roofs[1].size() * 4;
+            std::memcpy(to, a.roof_near_top.data(), a.roof_near_top.size() * sizeof(float));
         }
         a.eye = {camera[9], camera[10], camera[11]};
         a.eye_known = true;
@@ -1280,14 +1357,14 @@ bool record_cover(Shared& s) {
                 to[v * 4] = from[v * 3], to[v * 4 + 1] = from[v * 3 + 1], to[v * 4 + 2] = from[v * 3 + 2], to[v * 4 + 3] = 0;
             }
         }
-        // Each place kept clear: how much snow shows in it (0: none); then a board-shaped one's forward and
+        // Each place kept clear: how much of the cover shows in it (its dusting) (0: none); then a board-shaped one's forward and
         // half its length, its up and half its width (0: an upright cylinder).
         float* const places = out + camera_candidates * 4 * 4;
         for (std::size_t c = 0; c < most_clear; ++c) {
             float* const to = places + c * place_floats4 * 4;
             std::fill(to, to + place_floats4 * 4, 0.0f);
             if (c >= clear.size()) continue;
-            to[0] = clear[c].snow;
+            to[0] = clear[c].dusting;
             if (clear[c].length > 0) {
                 for (std::size_t k = 0; k < 3; ++k) to[4 + k] = clear[c].forward[k], to[8 + k] = clear[c].up[k];
                 to[7] = clear[c].length * 0.5f;
@@ -1315,13 +1392,13 @@ bool record_cover(Shared& s) {
     // Last frame's camera counts (for the flakes' streaks) only if the cover was drawn on the frame
     // before this one.
     const bool have_last = s.last_drawn_frame + 1 == s.frame;
-    // The target: the picture. Made without our hook: it takes the lock held here.
+    // The target: the picture.
     D3D12_RENDER_TARGET_VIEW_DESC target_view{};
     target_view.Format = s.colour_format;
     target_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     const UINT target_step = s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto target = s.targets->GetCPUDescriptorHandleForHeapStart();
-    original_rtv.load()(s.device, s.colour, &target_view, target);
+    s.device->CreateRenderTargetView(s.colour, &target_view, target);
 
     auto* list = s.list.Get();
     const auto before = s.colour_state;
@@ -1330,7 +1407,7 @@ bool record_cover(Shared& s) {
     transition(list, s.picture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     transition(list, s.colour, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-    // A change of the distance held slides the snow's pattern over half a second instead of jumping it.
+    // A change of the distance held slides the cover's pattern over half a second instead of jumping it.
     if (s.held_near <= 0 || s.shown_near <= 0 || now < s.shown_near_at) {
         s.shown_near = s.held_near;
     } else {
@@ -1339,7 +1416,7 @@ bool record_cover(Shared& s) {
         if (std::abs(s.shown_near - s.held_near) < s.held_near * 1e-4f) s.shown_near = s.held_near;
     }
     s.shown_near_at = now;
-    // The snow's fall, at the speed asked for now: a change of speed carries on from where the flakes are.
+    // The flakes' fall, at the speed asked for now: a change of speed carries on from where the flakes are.
     // Once an hour or so it starts again (as the time it was taken from did), so the GPU's float holds it.
     if (s.fallen_at && now > s.fallen_at) s.fallen += static_cast<double>(std::min<std::uint64_t>(now - s.fallen_at, 250)) / 1000.0 * settings.fall_speed;
     s.fallen_at = now;
@@ -1353,11 +1430,11 @@ bool record_cover(Shared& s) {
         m[9], m[10], m[11], s.shown_near, // the near distance measured (0: not yet, the shader measures its own)
         settings.colour[0], settings.colour[1], settings.colour[2], settings.amount,
         settings.facing, settings.softness, settings.brightness, settings.breakup,
-        settings.sparkle, static_cast<float>(s.fallen), settings.snowfall, settings.fall_speed,
+        settings.sparkle, static_cast<float>(s.fallen), settings.fall, settings.fall_speed,
         static_cast<float>(std::min(clear.size(), most_clear)), 0, 0, 0, // then each place's height, below
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // the places' feet and radii, below
         s.last_camera[0], s.last_camera[1], s.last_camera[2], have_last ? 1.0f : 0.0f,
-        s.last_camera[3], s.last_camera[4], s.last_camera[5], 0,
+        s.last_camera[3], s.last_camera[4], s.last_camera[5], s.light || settings.light ? 1.0f : 0.0f, // light (world_cover.hlsl)
         s.last_camera[6], s.last_camera[7], s.last_camera[8], settings.left,
         s.last_camera[9], s.last_camera[10], s.last_camera[11], stopping_seconds};
     for (std::size_t i = 0; i < clear.size() && i < most_clear; ++i) {
@@ -1392,7 +1469,7 @@ bool record_cover(Shared& s) {
         D3D12_RENDER_TARGET_VIEW_DESC measure_view{};
         measure_view.Format = DXGI_FORMAT_R32_FLOAT;
         measure_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        original_rtv.load()(s.device, s.measure.Get(), &measure_view, measure_target);
+        s.device->CreateRenderTargetView(s.measure.Get(), &measure_view, measure_target);
         transition(list, s.measure.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->SetPipelineState(s.measure_pipeline.Get());
         const D3D12_VIEWPORT measure_viewport{0, 0, static_cast<float>(measure_columns), static_cast<float>(camera_candidates), 0, 1};
@@ -1412,13 +1489,21 @@ bool record_cover(Shared& s) {
         from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         from.SubresourceIndex = 0;
         list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-        s.measure_waiting[at] = true;
-        s.measure_fresh[at] = s.depth_copied_frame == s.frame;
     }
 
     transition(list, s.colour, D3D12_RESOURCE_STATE_RENDER_TARGET, before);
     transition(list, s.picture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (s.timer_heap) {
+        list->EndQuery(s.timer_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(at * 2 + 1));
+        list->ResolveQueryData(s.timer_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(at * 2), 2, s.timer_readback.Get(),
+                               at * 2 * sizeof(std::uint64_t));
+    }
     if (FAILED(list->Close())) return false;
+    // Only once the list is closed (it goes to the GPU now): one that failed to close never runs, and its
+    // slot read back next time would be an older frame's, taken as this one's.
+    s.measure_waiting[at] = true;
+    s.measure_fresh[at] = s.depth_copied_frame == s.frame;
+    s.timer_waiting[at] = s.timer_heap != nullptr;
     s.last_drawn_frame = s.frame;
     s.why = nullptr;
     return true;
@@ -1439,18 +1524,76 @@ bool depth_shaped(const D3D12_RESOURCE_DESC& d, std::uint32_t width, std::uint32
 
 } // namespace
 
+// The cover's hooks and its shaders' compile, the first time a plugin asks for a cover (and the overlay's graphics
+// are up): a player whose plugins draw none has none of them. Installed at the overlay's start, every player had
+// them. Two functions, both through tables every one of the runtime's queues and command lists share (found
+// through the overlay's own): ExecuteCommandLists (the cover's moment) and SetComputeRootConstantBufferView (the
+// game's camera). The game is running by then, so in one HookBatch. Each is hooked where it is; where its code
+// cannot be (Proton's D3D12, vkd3d-proton, refused one on a Steam Deck, 2026-11-13), its slot in the table is
+// pointed at ours instead: calls through the interface, which are what the game makes, come to us the same.
+static void ensure_hooks() noexcept {
+    static std::mutex mutex;
+    static bool hooked{};
+    std::lock_guard once(mutex);
+    void** const queues = queue_table.load();
+    void** const lists = list_table.load();
+    if (hooked || !queues || !lists) return;
+    hooked = true;
+    try {
+        start_compiling();
+        ComPtr<ID3D12Device> device;
+        {
+            auto& s = shared();
+            std::lock_guard lock(s.mutex);
+            device = s.device;
+        }
+        const auto hook = [](void** table, std::size_t slot, void* detour, auto& original, const char* name) {
+            using Fn = std::remove_reference_t<decltype(original.load())>;
+            void* const target = table[slot];
+            void* trampoline{};
+            if (hook_prepare(target, detour, &trampoline) == HookOk) {
+                original.store(reinterpret_cast<Fn>(trampoline));
+                if (hook_enable(target) == HookOk) return true; // (queued: the batch attaches it)
+                original.store(nullptr);
+            }
+            void* previous{};
+            if (patch_table_slot(name, &table[slot], target, detour, &previous) == HookOk) {
+                original.store(reinterpret_cast<Fn>(previous));
+                logging::printf(logging::Level::info, logging::Channel::graphics, "World cover: %s is followed through its table slot.", name);
+                return true;
+            }
+            logging::printf(logging::Level::warning, logging::Channel::graphics, "World cover: %s hook could not be put in place.", name);
+            return false;
+        };
+        bool ok = false;
+        {
+            HookBatch batch;
+            // The GPU memory watch, light, for reading the game's camera (gpu_diagnostics.h): from now on, and
+            // from the start of the next few launches.
+            if (device) overlay::watch_gpu_memory_for_cover(device.Get());
+            ok = hook(queues, queue_execute, reinterpret_cast<void*>(&hooked_execute), original_execute, "ExecuteCommandLists");
+            // The game's own camera (game_camera): without it, the delayed camera is used.
+            if (ok) (void)hook(lists, list_compute_root_cbv, reinterpret_cast<void*>(&hooked_compute_cbv), original_compute_cbv,
+                               "SetComputeRootConstantBufferView");
+        }
+        if (!ok) say_failed("its D3D12 hooks are not all in place.");
+        else logging::write(logging::Level::info, logging::Channel::graphics, "World cover: hooks installed, as a plugin asked for a cover.");
+    } catch (...) {}
+}
+
 void set(const Settings& settings) noexcept {
     auto& a = asked();
     {
         std::lock_guard lock(a.mutex);
-        if (settings.snowfall_stopping && !a.stopping_since) a.stopping_since = GetTickCount64();
-        if (!settings.snowfall_stopping) a.stopping_since = 0;
+        if (settings.fall_stopping && !a.stopping_since) a.stopping_since = GetTickCount64();
+        if (!settings.fall_stopping) a.stopping_since = 0;
         a.settings = settings;
     }
     wanted.store(true);
+    ensure_hooks();
 }
 void clear() noexcept { wanted.store(false); }
-void add_trail(const std::array<float, 3>& at, float width, float fade, float tread, bool starts) noexcept {
+void add_trail(const std::array<float, 3>& at, float width, float fade, float tread, bool starts, int tread_lines) noexcept {
     try {
         auto& a = asked();
         std::lock_guard lock(a.mutex);
@@ -1459,46 +1602,181 @@ void add_trail(const std::array<float, 3>& at, float width, float fade, float tr
             const float dx = at[0] - last[0], dy = at[1] - last[1], dz = at[2] - last[2];
             if (dx * dx + dy * dy + dz * dz < 0.05f * 0.05f) return;
         }
-        a.trail.push_back({at, width, fade, tread, starts, GetTickCount64()});
+        a.trail.push_back({at, width, fade, tread, starts, std::clamp(tread_lines, 1, 31), GetTickCount64()});
         while (a.trail.size() > most_trail) a.trail.pop_front();
     } catch (...) {}
 }
 void measure_roofs(GroundTop ground_top) noexcept {
     try {
-        if (!ground_top || !wanted.load()) return;
+        if (!ground_top) return;
         auto& a = asked();
         std::array<float, 3> eye{};
         std::array<std::size_t, 2> next{};
+        bool measuring = wanted.load() && allowed.load();
         {
             std::lock_guard lock(a.mutex);
-            if (a.settings.under_roofs || !a.eye_known) return;
+            measuring = measuring && !a.settings.under_roofs && a.eye_known;
             eye = a.eye, next = a.roof_next;
         }
-        // Each grid's window of cells round the camera, measured in turn: the highest surface straight down
-        // over each cell's middle. Nothing there (collision not loaded, or open sky to below) is no roof.
+        // What this thread has measured, by slot: which cell, and its highest surface (the same as a.roofs,
+        // without its lock). And each grid's window offsets, nearest the middle first.
+        struct Known {
+            std::vector<std::array<int, 2>> cell;
+            std::vector<float> top;
+            std::vector<bool> measured;
+            std::vector<std::array<int, 2>> nearest_first;
+            std::array<int, 2> complete_at{}; // the window's first cell when all of it was last found measured
+            bool complete{};
+        };
+        static std::array<Known, 2> known;
+        static std::uint64_t near_top_at{};
+        static bool near_changed{};
+        static bool any_measured{};
+        // Not measuring (out of play: a menu, a level loading; or the cover off, or kept under roofs), all of it is
+        // forgotten: another level's roofs are not this one's. (With the cover off it had returned before this, and
+        // the old level's cells were kept into the next.)
+        if (!measuring) {
+            if (any_measured) {
+                any_measured = false;
+                for (auto& k : known) {
+                    std::fill(k.measured.begin(), k.measured.end(), false);
+                    k.complete = false;
+                }
+                std::lock_guard lock(a.mutex);
+                for (auto& grid_cells : a.roofs) std::fill(grid_cells.begin(), grid_cells.end(), std::array<float, 4>{});
+                std::fill(a.roof_near_top.begin(), a.roof_near_top.end(), 1e30f);
+                ++a.roof_version;
+            }
+            return;
+        }
+        // This tick's rays: at most roof_tick_budget_ms of them, and how long they took (said every 600 frames).
+        struct Timed {
+            std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+            std::uint64_t rays{};
+            double ms() const { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count(); }
+            ~Timed() {
+                const auto us = static_cast<std::uint64_t>(ms() * 1000.0);
+                roof_us_total.fetch_add(us), roof_rays.fetch_add(rays), roof_ticks.fetch_add(1);
+                for (auto most = roof_us_most.load(); us > most && !roof_us_most.compare_exchange_weak(most, us);) {}
+            }
+        } timed;
         std::array<std::vector<std::pair<std::size_t, std::array<float, 4>>>, 2> found;
+        std::array<int, 2> near_first{};
         for (std::size_t g = 0; g < roof_grids.size(); ++g) {
             const auto& grid = roof_grids[g];
+            const auto cells = roof_cells_of(grid);
+            auto& k = known[g];
+            if (k.cell.empty()) {
+                k.cell.assign(cells, {0, 0});
+                k.top.assign(cells, -1e30f);
+                k.measured.assign(cells, false);
+                for (int dz = 0; dz < grid.cells; ++dz)
+                    for (int dx = 0; dx < grid.cells; ++dx) k.nearest_first.push_back({dx, dz});
+                const int middle = grid.cells / 2;
+                std::stable_sort(k.nearest_first.begin(), k.nearest_first.end(), [&](const auto& p, const auto& q) {
+                    return (p[0] - middle) * (p[0] - middle) + (p[1] - middle) * (p[1] - middle) <
+                           (q[0] - middle) * (q[0] - middle) + (q[1] - middle) * (q[1] - middle);
+                });
+            }
             const int first_x = static_cast<int>(std::floor(eye[0] / grid.size)) - grid.cells / 2;
             const int first_z = static_cast<int>(std::floor(eye[2] / grid.size)) - grid.cells / 2;
-            const auto cells = roof_cells_of(grid);
-            found[g].reserve(static_cast<std::size_t>(grid.per_tick));
-            for (int k = 0; k < grid.per_tick; ++k) {
-                const auto n = (next[g] + static_cast<std::size_t>(k)) % cells;
-                const int cell_x = first_x + static_cast<int>(n % static_cast<std::size_t>(grid.cells));
-                const int cell_z = first_z + static_cast<int>(n / static_cast<std::size_t>(grid.cells));
+            if (g == 0) near_first = {first_x, first_z};
+            const auto slot_of = [&](int cell_x, int cell_z) {
+                return static_cast<std::size_t>(((cell_x % grid.cells) + grid.cells) % grid.cells +
+                                                (((cell_z % grid.cells) + grid.cells) % grid.cells) * grid.cells);
+            };
+            // One cell's ray, if the tick's time allows (the clock is read here, before a ray, only: read for each
+            // of the 16,384 cells looked over, the ones skipped too, it took the budget on a slow CPU). False when
+            // the time is up: the rest next tick.
+            bool out_of_time = false;
+            const auto measure = [&](int cell_x, int cell_z) {
+                if (out_of_time || timed.ms() >= roof_tick_budget_ms) {
+                    out_of_time = true;
+                    return false;
+                }
+                ++timed.rays;
+                any_measured = true;
                 const float x = (static_cast<float>(cell_x) + 0.5f) * grid.size, z = (static_cast<float>(cell_z) + 0.5f) * grid.size;
                 const auto top = ground_top(x, z, eye[1] + roof_reach, eye[1] - roof_reach);
-                const auto slot = static_cast<std::size_t>(((cell_x % grid.cells) + grid.cells) % grid.cells +
-                                                           (((cell_z % grid.cells) + grid.cells) % grid.cells) * grid.cells);
-                found[g].push_back({slot, {top ? *top : -1e30f, static_cast<float>(cell_x), static_cast<float>(cell_z), 1.0f}});
+                const auto slot = slot_of(cell_x, cell_z);
+                const float value = top ? *top : -1e30f;
+                if (k.measured[slot] && k.cell[slot] == std::array<int, 2>{cell_x, cell_z} && k.top[slot] == value) return true; // no change
+                k.cell[slot] = {cell_x, cell_z}, k.top[slot] = value, k.measured[slot] = true;
+                found[g].push_back({slot, {value, static_cast<float>(cell_x), static_cast<float>(cell_z), 1.0f}});
+                if (g == 0) near_changed = true;
+                return true;
+            };
+            // The window's cells not measured yet, the nearest first (none to look for while the window has not
+            // moved since all of it was).
+            if (!k.complete || k.complete_at != std::array<int, 2>{first_x, first_z}) {
+                int left = grid.new_tick;
+                for (const auto& [dx, dz] : k.nearest_first) {
+                    if (left <= 0) break;
+                    const int cell_x = first_x + dx, cell_z = first_z + dz;
+                    const auto slot = slot_of(cell_x, cell_z);
+                    if (k.measured[slot] && k.cell[slot] == std::array<int, 2>{cell_x, cell_z}) continue;
+                    if (!measure(cell_x, cell_z)) break;
+                    --left;
+                }
+                k.complete = left > 0 && !out_of_time;
+                k.complete_at = {first_x, first_z};
             }
-            next[g] = (next[g] + static_cast<std::size_t>(grid.per_tick)) % cells;
+            // And some again, in turn.
+            for (int again = 0; again < grid.again_tick; ++again) {
+                const auto n = (next[g] + static_cast<std::size_t>(again)) % cells;
+                if (!measure(first_x + static_cast<int>(n % static_cast<std::size_t>(grid.cells)), first_z + static_cast<int>(n / static_cast<std::size_t>(grid.cells))))
+                    break;
+            }
+            next[g] = (next[g] + static_cast<std::size_t>(grid.again_tick)) % cells;
+        }
+        // The near grid's highest surface over each block and those round it (roof_block), at most four times a
+        // second: a cell of the window not measured yet counts as a roof over everything (unknown).
+        std::vector<float> near_top;
+        const auto now = GetTickCount64();
+        if (near_changed && now - near_top_at >= 250) {
+            near_changed = false;
+            near_top_at = now;
+            const auto& grid = roof_grids[0];
+            const auto& k = known[0];
+            const int n = grid.cells;
+            // The highest of each block, then of each block and those round it (blocks wrap round: across the
+            // window's edge it only takes in more, so it is never too low).
+            std::vector<float> block_top(static_cast<std::size_t>(roof_blocks) * roof_blocks, -1e30f);
+            for (int sz = 0; sz < n; ++sz)
+                for (int sx = 0; sx < n; ++sx) {
+                    // The window's cell in this slot.
+                    const int cell_x = near_first[0] + (((sx - near_first[0]) % n) + n) % n;
+                    const int cell_z = near_first[1] + (((sz - near_first[1]) % n) + n) % n;
+                    const auto slot = static_cast<std::size_t>(sx + sz * n);
+                    const float value = k.measured[slot] && k.cell[slot] == std::array<int, 2>{cell_x, cell_z} ? k.top[slot] : 1e30f;
+                    auto& block = block_top[static_cast<std::size_t>(sx / roof_block + (sz / roof_block) * roof_blocks)];
+                    block = std::max(block, value);
+                }
+            near_top.assign(block_top.size(), -1e30f);
+            for (int bz = 0; bz < roof_blocks; ++bz)
+                for (int bx = 0; bx < roof_blocks; ++bx) {
+                    float most = -1e30f;
+                    for (int dz = -1; dz <= 1; ++dz)
+                        for (int dx = -1; dx <= 1; ++dx)
+                            most = std::max(most, block_top[static_cast<std::size_t>((bx + dx + roof_blocks) % roof_blocks +
+                                                                                      ((bz + dz + roof_blocks) % roof_blocks) * roof_blocks)]);
+                    near_top[static_cast<std::size_t>(bx + bz * roof_blocks)] = most;
+                }
+        }
+        if (found[0].empty() && found[1].empty() && near_top.empty()) {
+            std::lock_guard lock(a.mutex);
+            a.roof_next = next;
+            return;
         }
         std::lock_guard lock(a.mutex);
         for (std::size_t g = 0; g < found.size(); ++g)
             for (const auto& [slot, cell] : found[g]) a.roofs[g][slot] = cell;
+        if (!near_top.empty()) {
+            a.roof_near_top = std::move(near_top);
+            a.roof_near_first = near_first;
+        }
         a.roof_next = next;
+        ++a.roof_version;
     } catch (...) {}
 }
 void keep_clear(std::vector<Clear> places) noexcept {
@@ -1537,228 +1815,30 @@ bool on() noexcept { return wanted.load(); }
 
 void install(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list) noexcept {
     if (!device || !queue || !list) return;
-    start_compiling(); // ready long before the snow comes on
     auto& s = shared();
     {
         std::lock_guard lock(s.mutex);
         s.device = device;
         s.queue = queue;
     }
-    static std::atomic<bool> hooked{};
-    if (hooked.exchange(true)) return;
-    // Each function is hooked where it is; where its code cannot be (Proton's D3D12, vkd3d-proton, refused
-    // CopyDescriptors on a Steam Deck, 2026-11-13, and the cover never came on), its slot in the
-    // interface's table is pointed at ours instead: calls through the interface, which are what the game
-    // makes, come to us the same.
-    const auto hook = [](void** table, std::size_t slot, void* detour, auto& original, const char* name) {
-        using Fn = std::remove_reference_t<decltype(original.load())>;
-        void* const target = table[slot];
-        void* trampoline{};
-        if (hook_prepare(target, detour, &trampoline) == HookOk) {
-            original.store(reinterpret_cast<Fn>(trampoline));
-            if (hook_enable(target) == HookOk) return true;
-            original.store(nullptr);
-        }
-        void* previous{};
-        if (patch_table_slot(name, &table[slot], target, detour, &previous) == HookOk) {
-            original.store(reinterpret_cast<Fn>(previous));
-            logging::printf(logging::Level::info, logging::Channel::graphics, "World cover: %s is followed through its table slot.", name);
-            return true;
-        }
-        logging::printf(logging::Level::warning, logging::Channel::graphics, "World cover: %s hook could not be put in place.", name);
-        return false;
-    };
-    auto* const device_table = *reinterpret_cast<void***>(device);
-    auto* const list_table = *reinterpret_cast<void***>(list);
-    auto* const queue_table = *reinterpret_cast<void***>(queue);
-    const bool ok = hook(device_table, device_create_rtv, reinterpret_cast<void*>(&hooked_rtv), original_rtv, "CreateRenderTargetView") &&
-                    hook(device_table, device_create_dsv, reinterpret_cast<void*>(&hooked_dsv), original_dsv, "CreateDepthStencilView") &&
-                    hook(device_table, device_copy_descriptors, reinterpret_cast<void*>(&hooked_copy), original_copy, "CopyDescriptors") &&
-                    hook(device_table, device_copy_simple, reinterpret_cast<void*>(&hooked_copy_simple), original_copy_simple, "CopyDescriptorsSimple") &&
-                    hook(list_table, list_set_targets, reinterpret_cast<void*>(&hooked_targets), original_targets, "OMSetRenderTargets") &&
-                    hook(queue_table, queue_execute, reinterpret_cast<void*>(&hooked_execute), original_execute, "ExecuteCommandLists");
-    // The game's own camera (game_camera): without it, the delayed camera is used, as before.
-    if (ok) (void)hook(list_table, list_compute_root_cbv, reinterpret_cast<void*>(&hooked_compute_cbv), original_compute_cbv,
-                       "SetComputeRootConstantBufferView");
-    // Render passes (ID3D12GraphicsCommandList4) bind targets too; only when the runtime's lists have them.
-    ComPtr<ID3D12GraphicsCommandList4> list4;
-    if (ok && SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list4))) && list4) {
-        auto* const table4 = *reinterpret_cast<void***>(list4.Get());
-        (void)hook(table4, list_begin_render_pass, reinterpret_cast<void*>(&hooked_render_pass), original_render_pass, "BeginRenderPass");
-    }
-    if (!ok) say_failed("its D3D12 hooks are not all in place.");
-    else logging::write(logging::Level::info, logging::Channel::graphics, "World cover: hooks installed.");
-}
-
-// ---- Research (the camera-research branch, not for merging) ----------------------------------------
-// Looking for the camera the game draws each frame with, in its constant buffers: every three seconds, one
-// frame's constant buffers (with the launcher's GPU diagnostics on, which knows the game's GPU memory) are
-// read and searched for the camera's axes, as the rows or the columns of a matrix, against the cameras of
-// the last frames and the one now. What matches, and which camera it matches best, is said in the log.
-namespace camera_search {
-struct Bound {
-    int kind{};          // 0 compute root view, 1 graphics root view, 2 descriptor
-    unsigned index{};    // root parameter
-    std::uint64_t address{};
-};
-std::mutex bound_mutex;
-std::vector<Bound> bound;
-std::atomic<bool> taking{};
-void take(int kind, unsigned index, std::uint64_t address) noexcept {
-    if (!taking.load(std::memory_order_relaxed)) return;
-    try {
-        std::lock_guard lock(bound_mutex);
-        if (bound.size() < 60000) bound.push_back({kind, index, address});
-    } catch (...) {}
-}
-using Camera = std::array<float, camera_floats>; // right, up, back, eye
-// How far three floats (each `stride` apart) are from an axis, either way round (a forward is a back the
-// other way): the largest difference.
-float axis_error(const float* f, std::size_t stride, const float* axis) {
-    float same = 0, flipped = 0;
-    for (std::size_t c = 0; c < 3; ++c) {
-        same = std::max(same, std::abs(f[c * stride] - axis[c]));
-        flipped = std::max(flipped, std::abs(f[c * stride] + axis[c]));
-    }
-    return std::min(same, flipped);
-}
-// A matrix's rotation at `f` against a camera: rows (the axes one after another, 4 floats apart) or columns
-// (each axis down a column: a view matrix, the camera's turn undone).
-float matrix_error(const float* f, bool columns, const Camera& c) {
-    const std::size_t stride = columns ? 4 : 1, apart = columns ? 1 : 4;
-    float worst = 0;
-    for (std::size_t a = 0; a < 3; ++a) worst = std::max(worst, axis_error(f + a * apart, stride, c.data() + a * 3));
-    return worst;
-}
-// Whether a matrix's rotation is one: every float finite, each axis about a unit long (data that is not
-// numbers matched every camera before, 2026-11-13).
-bool rotation_like(const float* f, bool columns) {
-    const std::size_t stride = columns ? 4 : 1, apart = columns ? 1 : 4;
-    for (std::size_t a = 0; a < 3; ++a) {
-        float length = 0;
-        for (std::size_t c = 0; c < 3; ++c) {
-            const float v = f[a * apart + c * stride];
-            if (!std::isfinite(v)) return false;
-            length += v * v;
-        }
-        if (std::abs(length - 1.0f) > 0.02f) return false;
-    }
-    return true;
-}
-void search(const std::vector<Bound>& seen, const std::vector<std::pair<std::string, Camera>>& cameras) {
-    // Each address bound, in the order of the frame: how often, and the first time; and where the snow was
-    // recorded among the binds (kind -1).
-    struct Use {
-        std::size_t count{}, first{};
-    };
-    std::map<std::tuple<int, unsigned, std::uint64_t>, Use> uses;
-    std::size_t snow_at = ~std::size_t{0}, binds = 0;
-    for (const auto& b : seen) {
-        if (b.kind < 0) {
-            if (snow_at == ~std::size_t{0}) snow_at = binds;
-            continue;
-        }
-        auto& use = uses[{b.kind, b.index, b.address}];
-        if (!use.count) use.first = binds;
-        ++use.count;
-        ++binds;
-    }
-    struct Match {
-        float error{};
-        std::size_t first{};
-        std::string key, line;
-    };
-    std::vector<Match> matches;
-    std::size_t readable = 0;
-    std::array<float, 256> f{};
-    for (const auto& [where, use] : uses) {
-        const auto& [kind, index, address] = where;
-        std::uint64_t start{}, length{};
-        const auto got = overlay::read_gpu_buffer(address, f.data(), sizeof(f), &start, &length) / sizeof(float);
-        if (!got) continue;
-        ++readable;
-        for (std::size_t i = 0; i + 12 <= got; ++i) {
-            for (const bool columns : {false, true}) {
-                if (!rotation_like(f.data() + i, columns)) continue;
-                std::vector<float> errors;
-                for (const auto& [name, camera] : cameras) errors.push_back(matrix_error(f.data() + i, columns, camera));
-                const auto best = static_cast<std::size_t>(std::min_element(errors.begin(), errors.end()) - errors.begin());
-                if (errors[best] > 0.02f) continue;
-                const char* kind_name = kind == 0 ? "compute root view" : kind == 1 ? "graphics root view" : "descriptor";
-                std::string line = std::format("{} {} at +{} bytes ({}), in a buffer of {} bytes at +{}: bound {} time(s), first at bind {} of {}; "
-                                               "{} best ({:.4f}); the others",
-                                               kind_name, index, i * 4, columns ? "columns" : "rows", length, address - start, use.count, use.first,
-                                               binds, cameras[best].first, errors[best]);
-                for (std::size_t k = 0; k < errors.size(); ++k)
-                    if (k != best) line += std::format(" {} {:.4f}", cameras[k].first, errors[k]);
-                const auto& c = cameras[best].second;
-                if (i + 15 <= got && !columns)
-                    line += std::format("; its fourth row {:.2f} {:.2f} {:.2f}, the eye {:.2f} {:.2f} {:.2f}", f[i + 12], f[i + 13], f[i + 14], c[9], c[10], c[11]);
-                if (columns) {
-                    const float tx = -(c[0] * c[9] + c[1] * c[10] + c[2] * c[11]), ty = -(c[3] * c[9] + c[4] * c[10] + c[5] * c[11]),
-                                tz = -(c[6] * c[9] + c[7] * c[10] + c[8] * c[11]);
-                    line += std::format("; its fourth column {:.2f} {:.2f} {:.2f}, the eye undone {:.2f} {:.2f} {:.2f}", f[i + 3], f[i + 7], f[i + 11], tx, ty, tz);
-                }
-                // One line for each kind of place (the same view, offset, layout and buffer size), its earliest bind.
-                matches.push_back({errors[best], use.first, std::format("{} {} {} {} {}", kind, index, i, columns, length), std::move(line)});
-            }
-        }
-    }
-    std::sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.first < b.first; });
-    std::set<std::string> said;
-    std::vector<const Match*> shown;
-    for (const auto& m : matches)
-        if (said.insert(m.key).second) shown.push_back(&m);
-    logging::printf(logging::Level::info, logging::Channel::graphics,
-                    "Camera search: %zu binds of %zu constant buffers in a frame (the snow recorded at bind %zu), %zu readable, %zu camera matrices in %zu kinds of place.",
-                    binds, uses.size(), snow_at, readable, matches.size(), shown.size());
-    for (std::size_t m = 0; m < shown.size() && m < 24; ++m)
-        logging::write(logging::Level::info, logging::Channel::graphics, "Camera search:   " + shown[m]->line);
-}
-// Each frame (present): one frame in every three seconds is taken.
-void step(const std::array<Camera, camera_history>& history, std::size_t known) {
-    static std::uint64_t next_at{};
-    static bool started{};
-    const auto now = GetTickCount64();
-    if (!started) {
-        started = true;
-        overlay::watch_constants(&take);
-        logging::write(logging::Level::info, logging::Channel::graphics,
-                       "Camera search: on (it needs the launcher's GPU diagnostics, which know the game's GPU memory).");
-        next_at = now + 5000;
-    }
-    if (taking.load()) {
-        taking.store(false);
-        std::vector<Bound> seen;
-        {
-            std::lock_guard lock(bound_mutex);
-            seen.swap(bound);
-        }
-        std::vector<std::pair<std::string, Camera>> cameras;
-        for (std::size_t k = 0; k < known; ++k) cameras.push_back({std::format("the camera {} frame(s) back", k), history[k]});
-        if (const auto view = plugin_camera::camera_now()) {
-            const auto& w = view->world;
-            cameras.push_back({"the camera now", Camera{w[0], w[1], w[2], w[4], w[5], w[6], w[8], w[9], w[10], w[12], w[13], w[14]}});
-        }
-        search(seen, cameras);
-        next_at = now + 3000;
-        return;
-    }
-    if (now >= next_at && known == camera_history) {
-        {
-            std::lock_guard lock(bound_mutex);
-            bound.clear();
-        }
-        taking.store(true);
-    }
-}
+    // Only where the hooks would go: they go in when a plugin first asks for a cover (ensure_hooks).
+    queue_table.store(*reinterpret_cast<void***>(queue));
+    list_table.store(*reinterpret_cast<void***>(list));
+    // A cover drawn in a recent launch: its shaders compile now, on their own thread (no hook, and nothing on the
+    // game's drawing thread), so it shows as soon as a plugin asks for it. Compiled only at the first cover, it
+    // showed a few seconds late each launch (2026-11-15).
+    // A cache of them already on disk is read only when a cover is asked for (it takes no time): with it read here,
+    // as the game started, the game's own pipeline creation failed (E_INVALIDARG) twice in two launches, and in
+    // neither launch without one (2026-11-15). The cause is not known.
+    if (overlay::cover_used_recently() && !has_shader_cache()) start_compiling();
+    if (wanted.load()) ensure_hooks(); // a cover asked for before the overlay's graphics were up
 }
 
 void present(std::uint32_t width, std::uint32_t height) noexcept {
     try {
         auto& s = shared();
         std::lock_guard lock(s.mutex);
-        const bool ready = original_execute.load() && original_targets.load() && !s.failed && s.queue && !retired.load();
+        const bool ready = original_execute.load() && !s.failed && s.queue && !retired.load();
         active.store(ready && wanted.load() && allowed.load());
         if (!active.load()) {
             s.notes.clear();
@@ -1771,7 +1851,6 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
                 s.candidate = nullptr;
                 s.candidate_run = 0;
                 main_depth_now.store(nullptr);
-                for (auto& handle : depth_handles) handle.store(0);
                 s.depth_state_known = false;
                 s.depth_width = s.depth_height = 0;
                 s.main_missed = 0;
@@ -1790,7 +1869,6 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
                            "World cover: the world's last drawing was in the frame's last batch, so the cover had no place before post-processing.");
         }
         s.width = width, s.height = height;
-        camera_search::step(s.cameras, s.cameras_known); // research
         s.main_missed = s.main_seen ? 0 : s.main_missed + 1;
         // How this frame went, counted; every 600 frames (the first eight times) said in the log.
         if (s.main_depth) {
@@ -1829,7 +1907,6 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
                 s.locked = best->first;
                 s.colour_format = best->second.format;
                 s.locked_missed = 0;
-                s.said_colour = true;
                 logging::printf(logging::Level::debug, logging::Channel::graphics,
                                 "World cover: the world's picture is the one written last after the depth in %u of %u frames (format %u).", best->second.count,
                                 s.frames_voted, static_cast<unsigned>(best->second.format));
@@ -1848,10 +1925,8 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         if (!s.said_drawn && !s.said_waiting && ++s.presents_wanted == 600) {
             s.said_waiting = true;
             logging::printf(logging::Level::info, logging::Channel::graphics,
-                            "World cover: not drawn yet; world depth %s, world picture %s, depth views known %u, render target views known %zu.",
-                            s.main_depth ? "found" : "not found", s.said_colour ? "found" : "not found",
-                            static_cast<unsigned>(std::count_if(depth_handles.begin(), depth_handles.end(), [](const auto& h) { return h.load() != 0; })),
-                            s.rtvs.size());
+                            "World cover: not drawn yet; world depth %s, world picture %s.", s.main_depth ? "found" : "not found",
+                            s.locked ? "found" : "not found");
         }
     } catch (...) {}
 }
@@ -1880,6 +1955,10 @@ void release() noexcept {
         s.measure_pipeline.Reset();
         s.measure_waiting = {};
         s.measure_fresh = {};
+        s.timer_heap.Reset();
+        s.timer_readback.Reset();
+        s.timer_cpu = nullptr;
+        s.timer_waiting = {};
         s.relearning = false;
         s.cameras_known = 0;
         s.clears = {};
@@ -1897,8 +1976,7 @@ void release() noexcept {
         s.root.Reset();
         s.pipeline_format = DXGI_FORMAT_UNKNOWN;
         s.notes.clear();
-        s.rtvs.clear();
-        s.dsvs.clear();
+        s.roof_uploaded = {}; // the next upload buffer is new: the roof map goes into each of its parts again
         s.device = nullptr;
         s.queue = nullptr;
         s.colour = nullptr;
@@ -2073,9 +2151,6 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
         s.depth_state_known = false;
         s.main_seen = true;
         s.main_missed = 0;
-        for (auto& handle : depth_handles) handle.store(0);
-        for (const auto& [handle, view] : s.dsvs)
-            if (view.resource == resource) remember_depth_handle(handle);
         s.depth_width = static_cast<std::uint32_t>(desc.Width);
         s.depth_height = desc.Height;
         logging::printf(logging::Level::info, logging::Channel::graphics,

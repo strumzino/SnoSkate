@@ -11,23 +11,23 @@ cbuffer constants : register(b0) {
     float4 eye_near;      // where it is, and the near distance the reversed depth is over when not measured
     float4 colour_amount; // the cover's colour, and how much of a covered surface it hides
     float4 shape;         // facing, softness, brightness, breakup
-    float4 extra;         // sparkle, how far the snow has fallen (seconds at the usual speed), how much snow falls (0 to 1), how fast (1 the usual)
+    float4 extra;         // sparkle, how far the flakes have fallen (seconds at the usual speed), how much falls (0 to 1), how fast (1 the usual)
     float4 clear_info;    // how many places are kept clear (0 to 3), then each one's height above its foot
     float4 clears[3];     // each: its foot in the world, and its radius
     float4 last_right;    // last frame's camera (as this frame's above), and whether it is last frame's (for the flakes' streaks)
-    float4 last_up;       // ... (w unused)
+    float4 last_up;       // ..., and 1 when light: fewer flakes and samples (the cover took too long on this GPU)
     float4 last_back;     // ..., and how much of the cover is left (melting: 1 all of it)
-    float4 last_eye;      // ..., and how long the snowfall has been stopping in seconds (-1: falling)
+    float4 last_eye;      // ..., and how long the fall has been stopping in seconds (-1: falling)
 };
 Texture2D<float4> scene : register(t0);
 Texture2D<float> depth : register(t1);
 // The cameras ps_measure tries (world_cover.cpp's camera_candidates): each its right, up, back and eye.
 StructuredBuffer<float4> cameras : register(t3);
 #define CANDIDATES 1
-// After the cameras: three float4s a place kept clear: (how much snow shows in it, -, -, -), then a
+// After the cameras: three float4s a place kept clear: (how much of the cover shows in it, -, -, -), then a
 // board-shaped one's (forward, half its length) and (up, half its width), w 0 for an upright cylinder.
 // Then the trails: [0] = (points, the box they lie in: min x, min z, max x), [1] = (max z, min y, max y,
-// -), then two a point, oldest first: (where, width), (how strong it still is, 0 to 1, its tread's width, -).
+// -), then two a point, oldest first: (where, width), (how strong it still is, 0 to 1, its tread's width, whether it starts a trail, its tread's lines).
 #define PLACES (CANDIDATES * 4)
 #define TRAIL (PLACES + 9)
 #define MOST_TRAIL 256
@@ -35,7 +35,9 @@ StructuredBuffer<float4> cameras : register(t3);
 // its cell size, the far grid's cells across), [1] = (the far grid's cell size, -, -, -), then the near grid's
 // cells, then the far grid's, a float4 a cell kept where its world position falls (x and z each modulo its
 // cells across): (the highest surface over the cell's middle, which cell it is: x, z, 1 once measured).
-#define ROOF (TRAIL + 2 + MOST_TRAIL * 2)
+// After the points, a box a run of 8 of them lies in (world_cover.cpp, trail_run): min x, min z, max x, max z.
+#define TRAIL_RUNS (TRAIL + 2 + MOST_TRAIL * 2)
+#define ROOF (TRAIL_RUNS + MOST_TRAIL / 8)
 // Something this far over a surface is a roof over it (a ceiling, a bridge), not a bench or a rail on it.
 #define ROOF_CLEARANCE 1.5
 
@@ -132,9 +134,10 @@ float cell_hash(float2 c) { return hash(c - 289.0 * floor(c / 289.0)); }
 // measured changed (getting off the board, walking about, 2026-11-13). The depth only says whether the
 // pixel is that ground at all (`here`, roughly), not a rail or a leg over it.
 // `shade`: how grey the pressed snow is at the pixel against the trail's own (1). Where a point has a tread
-// (its second float4's y, the tread's width), the tread's 13 lines run along the trail across that width,
-// centred on it: 7 lighter (0.55), with the tread's 6 raised ridges between them pressed darker (1.3), the
-// ridges a little narrower; outside the tread, and where the lines would be finer than the pixels, 1.
+// (its second float4's y, the tread's width), the tread's lines (its w, as many as the plugin asked for: 13 for
+// 7 lighter and 6 ridges) run along the trail across that width, centred on it: lighter ones (0.55), with the
+// tread's raised ridges between them pressed darker (1.3), the ridges a little narrower; outside the tread, and
+// where the lines would be finer than the pixels, 1.
 float trail_at(float3 here, float3 dir, out float shade) {
     shade = 1;
     const float4 head = cameras[TRAIL];
@@ -143,56 +146,69 @@ float trail_at(float3 here, float3 dir, out float shade) {
     const float4 box = cameras[TRAIL + 1];
     if (here.x < head.y - 1 || here.z < head.z - 1 || here.x > head.w + 1 || here.z > box.x + 1 || here.y < box.y - 1 || here.y > box.z + 1)
         return 0;
+    if (dir.y >= -1e-4) return 0; // a ray not going down meets no ground
     float pressed = 0;
-    float4 a = cameras[TRAIL + 2];
-    float strength_a = cameras[TRAIL + 3].x;
     float lines_strength = 0, lines_at = 0;
-    [loop] for (int i = 1; i < points; ++i) {
-        const float4 b = cameras[TRAIL + 2 + i * 2];
-        const float4 more_b = cameras[TRAIL + 3 + i * 2];
-        const float strength_b = more_b.x, tread = more_b.y;
-        const bool starts = more_b.z > 0.5; // b begins a new trail: no stretch from a
-        const float2 along = b.xz - a.xz;
-        const float length_squared = dot(along, along);
-        // Two points far apart are not one trail (a teleport, a respawn), nor is a point that starts a new one.
-        if (!starts && length_squared < 4.0 && length_squared > 1e-6 && strength_a > 0 && strength_b > 0 && dir.y < -1e-4) {
-            // The ray onto the ground of this stretch: the plane through both its points, level across it, so it
-            // follows a slope along the trail. A level plane at the stretch's middle height drew a trail up a
-            // slope as steps, jumping from one to the next (2026-11-13).
-            const float3 sideways = normalize(float3(-along.y, 0, along.x));
-            float3 ground_up = normalize(cross(b.xyz - a.xyz, sideways));
-            if (ground_up.y < 0) ground_up = -ground_up;
-            const float facing_ground = dot(dir, ground_up);
-            const float reach = facing_ground < -1e-4 ? dot(a.xyz - eye_near.xyz, ground_up) / facing_ground : -1;
-            const float3 on = eye_near.xyz + dir * reach;
-            const float seen = length(here - eye_near.xyz);
-            const float t = saturate(dot(on.xz - a.xz, along) / max(length_squared, 1e-6));
-            const float2 to = on.xz - (a.xz + along * t);
-            const float off = length(to);
-            if (reach > 0 && abs(here.y - lerp(a.y, b.y, t)) < 0.4 && abs(reach - seen) < seen * 0.15 + 0.1) {
-                const float half_width = b.w * 0.5;
-                const float here_pressed = (1 - smoothstep(half_width * 0.6, half_width, off)) * lerp(strength_a, strength_b, t);
-                if (here_pressed > pressed) {
-                    pressed = here_pressed;
-                    lines_strength = 0;
-                    if (tread > 0) {
-                        // Across the trail, signed, in pairs of lines (a light one and a ridge): the middle of a
-                        // light one at the trail's middle, 13 lines across the tread's width.
-                        const float pair = tread / 6.5;
-                        const float across = (along.x * to.y - along.y * to.x) * rsqrt(max(length_squared, 1e-6));
-                        const float f = frac(across / pair + 0.5);
-                        // A ridge where f is far from a light line's middle (0.5): 44% of each pair.
-                        lines_at = smoothstep(0.26, 0.3, abs(f - 0.5));
-                        // A pixel this far off covers reach / focal metres: none finer than about two of them,
-                        // and none past the tread's edge.
-                        const float pixel = reach / right_focal.w;
-                        lines_strength = (1 - smoothstep(pair * 0.22, pair * 0.4, pixel)) * (1 - smoothstep(tread * 0.5, tread * 0.5 + 0.005, abs(across)));
+    // A run's points only where the pixel is in its box: every pixel in the trails' box read every point, and on
+    // a Steam Deck the cover took 16 ms a frame on the GPU (2026-11-14).
+    [loop] for (int r = 0; r < MOST_TRAIL / 8; ++r) {
+        if (r * 8 >= points) break;
+        const float4 run = cameras[TRAIL_RUNS + r];
+        if (here.x < run.x || here.z < run.y || here.x > run.z || here.z > run.w) continue;
+        const int last = min(r * 8 + 8, points);
+        [loop] for (int i = max(r * 8, 1); i < last; ++i) {
+            const float4 a = cameras[TRAIL + 2 + (i - 1) * 2];
+            const float strength_a = cameras[TRAIL + 3 + (i - 1) * 2].x;
+            const float4 b = cameras[TRAIL + 2 + i * 2];
+            const float4 more_b = cameras[TRAIL + 3 + i * 2];
+            const float strength_b = more_b.x, tread = more_b.y, tread_lines = max(more_b.w, 1.0);
+            const bool starts = more_b.z > 0.5; // b begins a new trail: no stretch from a
+            const float2 along = b.xz - a.xz;
+            const float length_squared = dot(along, along);
+            // Two points far apart are not one trail (a teleport, a respawn), nor is a point that starts a new one.
+            // Far from this stretch (from the point the depth gives, on the ground): none of the work below. Every
+            // pixel went through all of it for every point (2026-11-14).
+            const float2 from_a = here.xz - a.xz;
+            const float2 nearest = from_a - along * saturate(dot(from_a, along) / max(length_squared, 1e-6));
+            const float reach_out = b.w * 0.5 + 0.5;
+            if (!starts && length_squared < 4.0 && length_squared > 1e-6 && strength_a > 0 && strength_b > 0 &&
+                dot(nearest, nearest) < reach_out * reach_out) {
+                // The ray onto the ground of this stretch: the plane through both its points, level across it, so it
+                // follows a slope along the trail. A level plane at the stretch's middle height drew a trail up a
+                // slope as steps, jumping from one to the next (2026-11-13).
+                const float3 sideways = normalize(float3(-along.y, 0, along.x));
+                float3 ground_up = normalize(cross(b.xyz - a.xyz, sideways));
+                if (ground_up.y < 0) ground_up = -ground_up;
+                const float facing_ground = dot(dir, ground_up);
+                const float reach = facing_ground < -1e-4 ? dot(a.xyz - eye_near.xyz, ground_up) / facing_ground : -1;
+                const float3 on = eye_near.xyz + dir * reach;
+                const float seen = length(here - eye_near.xyz);
+                const float t = saturate(dot(on.xz - a.xz, along) / max(length_squared, 1e-6));
+                const float2 to = on.xz - (a.xz + along * t);
+                const float off = length(to);
+                if (reach > 0 && abs(here.y - lerp(a.y, b.y, t)) < 0.4 && abs(reach - seen) < seen * 0.15 + 0.1) {
+                    const float half_width = b.w * 0.5;
+                    const float here_pressed = (1 - smoothstep(half_width * 0.6, half_width, off)) * lerp(strength_a, strength_b, t);
+                    if (here_pressed > pressed) {
+                        pressed = here_pressed;
+                        lines_strength = 0;
+                        if (tread > 0) {
+                            // Across the trail, signed, in pairs of lines (a light one and a ridge): the middle of a
+                            // light one at the trail's middle, tread_lines lines across the tread's width.
+                            const float pair = tread / (tread_lines * 0.5);
+                            const float across = (along.x * to.y - along.y * to.x) * rsqrt(max(length_squared, 1e-6));
+                            const float f = frac(across / pair + 0.5);
+                            // A ridge where f is far from a light line's middle (0.5): 44% of each pair.
+                            lines_at = smoothstep(0.26, 0.3, abs(f - 0.5));
+                            // A pixel this far off covers reach / focal metres: none finer than about two of them,
+                            // and none past the tread's edge.
+                            const float pixel = reach / right_focal.w;
+                            lines_strength = (1 - smoothstep(pair * 0.22, pair * 0.4, pixel)) * (1 - smoothstep(tread * 0.5, tread * 0.5 + 0.005, abs(across)));
+                        }
                     }
                 }
             }
         }
-        a = b;
-        strength_a = strength_b;
     }
     shade = lerp(1, lerp(0.55, 1.3, lines_at), lines_strength);
     return pressed;
@@ -237,7 +253,27 @@ float roof_blend(float3 at, float clearance) {
 // across, so the snow carries on a metre or so in under the edge and thins out smoothly over about two
 // metres, all gone further in. A broad, gentle wander in the world keeps the edge from looking ruled, and
 // stays put. (Before: an edge a few centimetres, then one of 1.5 m with small, jagged noise, 2026-11-13.)
+// Whether a point is under no roof, from one read: the highest surface over its block of the near grid and the
+// blocks round it (world_cover.cpp, roof_block) is not `clearance` over it. False where that cannot tell (the
+// point outside the near grid, or the map not on).
+bool no_roof_near(float3 at, float clearance) {
+    const float4 head = cameras[ROOF];
+    if (head.x <= 0) return true;
+    const int near_cells = (int)head.y;
+    const int2 cell = int2(floor(at.xz / head.z));
+    const int2 first = int2(cameras[ROOF + 1].yz);
+    if (!(all(cell >= first) && all(cell < first + near_cells))) return false;
+    const int2 slot = ((cell % near_cells) + near_cells) % near_cells;
+    const int blocks = near_cells / 8;
+    const int index = slot.x / 8 + (slot.y / 8) * blocks;
+    const float4 tops = cameras[ROOF + 2 + near_cells * near_cells + (int)head.w * (int)head.w + index / 4];
+    const int which = index % 4;
+    const float near_top = which == 0 ? tops.x : which == 1 ? tops.y : which == 2 ? tops.z : tops.w;
+    return at.y >= near_top - clearance;
+}
 float roofed_at(float3 at) {
+    // No roof near, from one read (most of the ground).
+    if (no_roof_near(at, ROOF_CLEARANCE)) return 0;
     const float centre = roof_blend(at, ROOF_CLEARANCE);
     float outer = 0;
     [loop] for (int k = 0; k < 6; ++k) {
@@ -245,18 +281,23 @@ float roofed_at(float3 at) {
         outer += roof_blend(at + float3(cos(angle), 0, sin(angle)) * 2.2, ROOF_CLEARANCE);
     }
     if (centre + outer <= 0) return 0; // no roof near: most of the ground
-    float inner = 0;
-    [loop] for (int j = 0; j < 6; ++j) {
-        const float angle = j * 1.0471976 + 0.5235988;
-        inner += roof_blend(at + float3(cos(angle), 0, sin(angle)) * 1.1, ROOF_CLEARANCE);
+    float c;
+    if (last_up.w > 0.5) {
+        c = (centre * 2 + outer) / 8; // light: the outer ring only
+    } else {
+        float inner = 0;
+        [loop] for (int j = 0; j < 6; ++j) {
+            const float angle = j * 1.0471976 + 0.5235988;
+            inner += roof_blend(at + float3(cos(angle), 0, sin(angle)) * 1.1, ROOF_CLEARANCE);
+        }
+        c = (centre * 2 + inner + outer) / 14;
     }
-    float c = (centre * 2 + inner + outer) / 14;
     c += (noise(at.xz * 0.5) - 0.5) * 0.12;
     return smoothstep(0.5, 0.97, c);
 }
 // Whether a falling flake is under a roof. Flakes are hidden there one by one, so indoors none fall, and
 // through a doorway it still snows outside.
-bool roof_over(float3 at) { return roof_blend(at, 0) > 0.5; }
+bool roof_over(float3 at) { return !no_roof_near(at, 0) && roof_blend(at, 0) > 0.5; }
 
 float luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
@@ -308,8 +349,9 @@ float flake_layer(float3 dir, float limit, float cell, float chance, float radiu
     const float streak_length = length(streak);
     const float focal = right_focal.w;
     float t = 0, seen = 0;
+    const int steps = last_up.w > 0.5 ? 14 : 36; // light: fewer cells along the ray
     [loop] for (int i = 0; i < 36; ++i) {
-        if (t * cell > limit) break;
+        if (i >= steps || t * cell > limit) break;
         const float3 seed = hash3(c + salt);
         if (seed.x < chance) {
             float3 centre = c + 0.2 + seed.yzx * 0.6;
@@ -344,7 +386,7 @@ float flake_layer(float3 dir, float limit, float cell, float chance, float radiu
     return seen;
 }
 
-float3 snowfall(float3 colour, int2 p, float scene_distance, float exposure) {
+float3 falling_flakes(float3 colour, int2 p, float scene_distance, float exposure) {
     const float amount = extra.z;
     if (amount <= 0) return colour;
     const float3 dir = normalize(ray_of(p));
@@ -366,8 +408,9 @@ float3 snowfall(float3 colour, int2 p, float scene_distance, float exposure) {
     // so the last ones fall out of the sky instead of all going at once.
     const float top = last_eye.w < 0 ? 1e6 : 12.0 - fall * last_eye.w;
     if (top < -30.0) return colour;
-    const float near_limit = min(scene_distance, 7.0);
-    const float far_limit = min(scene_distance, 22.0);
+    const bool light = last_up.w > 0.5;
+    const float near_limit = min(scene_distance, light ? 5.0 : 7.0);
+    const float far_limit = min(scene_distance, light ? 12.0 : 22.0);
     float flakes = flake_layer(dir, near_limit, 0.45, amount * 0.45, 0.006, 0.5, shift, moved, seconds, top);
     flakes = max(flakes, flake_layer(dir, far_limit, 1.3, amount * 0.6, 0.012, 17.5, shift, moved, seconds, top) * 0.8);
     const float3 white = colour_amount.rgb * exposure * 1.6;
@@ -376,6 +419,12 @@ float3 snowfall(float3 colour, int2 p, float scene_distance, float exposure) {
 
 // The picture's brightness as a whole, for the flakes: a few points over the screen.
 float exposure_now() {
+    if (last_up.w > 0.5) // light: the middle and four round it
+        return max((luminance(scene.Load(int3(int2(up_width.w / 2, back_height.w / 2), 0)).rgb) +
+                    luminance(scene.Load(int3(int2(up_width.w / 4, back_height.w / 4), 0)).rgb) +
+                    luminance(scene.Load(int3(int2(up_width.w * 3 / 4, back_height.w / 4), 0)).rgb) +
+                    luminance(scene.Load(int3(int2(up_width.w / 4, back_height.w * 3 / 4), 0)).rgb) +
+                    luminance(scene.Load(int3(int2(up_width.w * 3 / 4, back_height.w * 3 / 4), 0)).rgb)) / 5, 1e-4);
     float sum = 0;
     [unroll] for (int y = 1; y <= 3; ++y)
         [unroll] for (int x = 1; x <= 3; ++x)
@@ -396,7 +445,7 @@ Output ps_main(Vertex input) {
     const float exposure = exposure_now();
     // The sky, and anything at the near plane (the camera inside something): snow falls in front of it.
     if (!(d > 0.0 && d < 1.0)) {
-        out_.colour.rgb = snowfall(under.rgb, p, d >= 1.0 ? 0 : 1e9, exposure);
+        out_.colour.rgb = falling_flakes(under.rgb, p, d >= 1.0 ? 0 : 1e9, exposure);
         return out_;
     }
     const float3 here = world_at(p, d, near_distance);
@@ -426,6 +475,22 @@ Output ps_main(Vertex input) {
         normal *= rsqrt(length_squared);
         // Facing the camera: the side the pixel is seen from.
         if (dot(normal, eye_near.xyz - here) < 0) normal = -normal;
+        // The surface's direction from a wider look too, points 12 pixels round, where that is the same surface
+        // (its direction within about 25 degrees of the near one's, blended in from about 35): a curved ramp is
+        // made of flat strips, and with each strip's own direction the snow lay in steps up it, a strip at a time
+        // (2026-11-14). Across an edge the two disagree, and it stays the near one's. (Not when light.)
+        if (last_up.w <= 0.5) {
+            const int2 wx = int2(12, 0), wy = int2(0, 12);
+            const float3 wide_across = world_at(p + wx, depth_at(p + wx), near_distance) - world_at(p - wx, depth_at(p - wx), near_distance);
+            const float3 wide_along = world_at(p + wy, depth_at(p + wy), near_distance) - world_at(p - wy, depth_at(p - wy), near_distance);
+            float3 wide = cross(wide_along, wide_across);
+            const float wide_squared = dot(wide, wide);
+            if (wide_squared > 1e-20) {
+                wide *= rsqrt(wide_squared);
+                if (dot(wide, eye_near.xyz - here) < 0) wide = -wide;
+                normal = normalize(lerp(normal, wide, smoothstep(0.82, 0.9, dot(wide, normal))));
+            }
+        }
 
         // Patchy where it thins: large, slow noise over the ground, in the world, so it stays put.
         const float patch = noise(steady.xz * 0.45) * 0.65 + noise(steady.xz * 1.9) * 0.35;
@@ -440,7 +505,12 @@ Output ps_main(Vertex input) {
         const float du2 = depth_at(p - int2(0, 2)), dd2 = depth_at(p + int2(0, 2));
         const float bend_across = min(abs(dl2 - 2 * dl + d), abs(d - 2 * dr + dr2));
         const float bend_along = min(abs(du2 - 2 * du + d), abs(d - 2 * dd + dd2));
-        cover *= 1 - smoothstep(0.0015, 0.006, max(bend_across, bend_along) / d);
+        // And only where it bends sharply for how steeply it already slopes on the screen: where a ramp's flat
+        // strips meet, a little, it is still flat; leaves, wires and edges bend sharply. With the bend alone
+        // the snow thinned along every join up a ramp (2026-11-14).
+        const float slope_across = max(abs(dr - dl) * 0.5, d * 1e-4), slope_along = max(abs(dd - du) * 0.5, d * 1e-4);
+        const float sharp = max(bend_across / slope_across, bend_along / slope_along);
+        cover *= 1 - smoothstep(0.0015, 0.006, max(bend_across, bend_along) / d) * smoothstep(0.2, 0.5, sharp);
         // None under a roof (indoors, under a bridge), where the plugin asks.
         cover *= 1 - roofed_at(steady);
     }
@@ -467,9 +537,9 @@ Output ps_main(Vertex input) {
             const float3 from = here - clears[c].xyz;
             const float radius = clears[c].w;
             const float height = c == 0 ? clear_info.y : c == 1 ? clear_info.z : clear_info.w;
-            const float snow = cameras[PLACES + c * 3].x;
+            const float dusting = cameras[PLACES + c * 3].x;
             // A board-shaped place (a deck riding low, which the cylinder's ground test takes for the
-            // ground): in its own plane and outline, rounded at its ends, the cover is `snow` of what it would
+            // ground): in its own plane and outline, rounded at its ends, the cover is `dusting` of what it would
             // be and no trail is pressed into it. A trail under the deck showed on its griptape (2026-11-13).
             const float4 axis = cameras[PLACES + c * 3 + 1], side_axis = cameras[PLACES + c * 3 + 2];
             if (axis.w > 0) {
@@ -492,7 +562,7 @@ Output ps_main(Vertex input) {
                                            (1 - smoothstep(0.05, 0.1, abs(reach - seen) / max(seen, 0.1))) : 0;
                 }
                 pressed *= 1 - in_board;
-                cover = lerp(cover, untrailed * snow, in_board);
+                cover = lerp(cover, untrailed * dusting, in_board);
                 continue;
             }
             const float inside = 1 - smoothstep(radius * 0.75, radius, length(from.xz));
@@ -519,14 +589,14 @@ Output ps_main(Vertex input) {
             const float on_it = max(smoothstep(0, 0.004, over), smoothstep(0.55, 0.65, from.y) * body);
             // What stands in it has a patchy dusting of snow, on every side, where the plugin asks for some
             // (the skater after rolling in it); the pattern goes with the place, so it moves with them.
-            const float dust = snow > 0 ? snow * smoothstep(0.35, 0.75, noise(from.xz * 14.0 + from.y * 9.0)) : 0;
+            const float dust = dusting > 0 ? dusting * smoothstep(0.35, 0.75, noise(from.xz * 14.0 + from.y * 9.0)) : 0;
             cover = lerp(cover, dust, inside * on_it);
             // And no trail on them: the trail's grey showed on the dusting on the skater's legs (2026-11-13).
             pressed *= 1 - inside * on_it;
         }
     }
     if (cover <= 0.002) {
-        out_.colour.rgb = snowfall(shown, p, scene_distance, exposure);
+        out_.colour.rgb = falling_flakes(shown, p, scene_distance, exposure);
         return out_;
     }
 
@@ -554,7 +624,7 @@ Output ps_main(Vertex input) {
         const float thin = noise(steady.xz * 0.9) * 0.6 + noise(steady.xz * 2.1) * 0.2;
         cover *= smoothstep(thin, thin + 0.35, left * 1.15);
         if (cover <= 0.002) {
-            out_.colour.rgb = snowfall(shown, p, scene_distance, exposure);
+            out_.colour.rgb = falling_flakes(shown, p, scene_distance, exposure);
             return out_;
         }
     }
@@ -564,6 +634,6 @@ Output ps_main(Vertex input) {
         const float glint = cell_hash(floor(steady.xz * 38.0) + floor(steady.y * 38.0));
         lit += light * extra.x * 6.0 * step(0.996, glint);
     }
-    out_.colour = float4(snowfall(lerp(shown, lit, cover), p, scene_distance, exposure), under.a);
+    out_.colour = float4(falling_flakes(lerp(shown, lit, cover), p, scene_distance, exposure), under.a);
     return out_;
 }

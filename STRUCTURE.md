@@ -99,9 +99,9 @@ fixup repair), mesh sets, skeletons, textures, material grids, shader lookup.
 ### `Engine/Vfs/`
 The virtual file system and modding pipeline:
 - `initfs`, `game_archives`, `game_bundles`, `game_textures`, `native_db` — reading the game's data.
-- `mod_list`, `mod_catalog`, `mod_item_sources`, `mod_conflicts`, `mod_scoring` — the `Mods/` folder and `mods.json`.
+- `mod_list`, `mod_catalog`, `mod_item_sources`, `mod_items`, `mod_conflicts`, `mod_scoring` — the `Mods/` folder and `mods.json`, the items a mod adds and the ones a player leaves out of it.
 - `variant_additions_*` — explicit variant cooperation, native admission and private-asset projection planning.
-- `mod_merge*` — merging mods into the game's data (overrides, combine, grid, textures, loading screens, CAS store, scan cache, build stamp).
+- `mod_merge*` — merging mods into the game's data (overrides, combine, grid, textures, loading screens, layout, CAS store, the scan of each mod and its cache, the items left out of a mod, build stamp).
 - `content_cache*`, `content_catalogs` — the merged-content cache and its install.
 - `thunderstore_package`, `https_download` — Thunderstore packages.
 - `mod_music`, `item_thumbnails`, `world_layer_scan`, `builtin_packs`.
@@ -184,14 +184,14 @@ The Luau plugin host. A plugin is a folder in `Mods/` with a `reskate-plugin.jso
 - `plugin_api*.cpp` — the `reskate.*` API (game, world, physics, UI, more); `plugin_game*`, `plugin_camera`, `plugin_joystick`.
 - `Test/` — the host tests, and in `Test/fixtures/` the plugins they load.
 - `plugin_ui`, `plugin_sound`, `plugin_wave`, `plugin_http`, `plugin_session_feed`, `plugin_wire` — pages, audio, HTTP, multiplayer messages.
+- `plugin_server_scope` — the plugins a dedicated server brought here, which run only on servers that require them.
 - `plugin_commands` — the `plugin` console command.
 - `plugin_effects`, `plugin_api_effects` — the permission, asset declarations and Lua calls for
   [plugin particles and decals](https://docs.reskate.dev/plugins/api/effects). `Extension/Rendering/plugin_effects`
   owns their native references, surface attachments and world lifetime.
   `reskate.effects.cover` (same permission) lays a cover (snow, sand, dust) over the world's upward-facing
   surfaces, drawn by `Extension/UI/Overlay/world_cover` into the finished scene just before the game adds
-  its UI. [contrib/snow-skate.md](contrib/snow-skate.md) says what it and the other calls Snow Skate needs
-  are for.
+  its UI.
 - [Item origins and favorites](https://docs.reskate.dev/plugins/api/mods) — `reskate.mods.item_origins` and
   `reskate.menu.favorites`, read-only, for plugins that filter the item grids.
 - [Other players' items](https://docs.reskate.dev/plugins/api/session#other-players-items) — `reskate.session.outfit` and

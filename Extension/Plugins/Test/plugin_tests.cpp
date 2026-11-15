@@ -7,6 +7,7 @@
 #include "Extension/Plugins/plugin_listing.h"
 #include "Extension/Objects/placement_geometry.h"
 #include "Extension/Plugins/plugin_manifest.h"
+#include "Extension/Plugins/plugin_server_scope.h"
 #include "Extension/Plugins/plugin_session_feed.h"
 #include "Extension/Plugins/plugin_wire.h"
 #include "Extension/Throwdowns/challenge_registry.h"
@@ -336,7 +337,7 @@ struct FakeGame final : Game {
         std::string line = std::format("keep clear {} {}", plugin, places.size());
         for (const auto& p : places) {
             line += std::format(" ({:.1f} {:.1f} {:.1f} r{:.2f} h{:.1f}", p.foot[0], p.foot[1], p.foot[2], p.radius, p.height);
-            if (p.snow > 0) line += std::format(" s{:.2f}", p.snow);
+            if (p.dusting > 0) line += std::format(" s{:.2f}", p.dusting);
             if (p.length > 0)
                 line += std::format(" l{:.2f} f{:.1f},{:.1f},{:.1f} u{:.1f},{:.1f},{:.1f}", p.length, p.forward[0], p.forward[1], p.forward[2], p.up[0], p.up[1], p.up[2]);
             line += ")";
@@ -347,7 +348,7 @@ struct FakeGame final : Game {
     std::string world_cover_trail(std::string_view plugin, const CoverTrail& point) override {
         if (coverer != plugin) return "this plugin has no cover on the world";
         calls.push_back(std::format("trail {} {:.1f} {:.1f} {:.1f} w{:.2f} f{:.1f}{}{}", plugin, point.at[0], point.at[1], point.at[2], point.width, point.fade,
-                                    point.tread > 0 ? std::format(" t{:.2f}", point.tread) : std::string{}, point.starts ? " new" : ""));
+                                    point.tread > 0 ? std::format(" t{:.2f}x{}", point.tread, point.tread_lines) : std::string{}, point.starts ? " new" : ""));
         return {};
     }
     std::string world_cover(std::string_view plugin, std::optional<WorldCover> c) override {
@@ -362,7 +363,7 @@ struct FakeGame final : Game {
         coverer = plugin;
         cover_asked = c;
         calls.push_back(std::format("cover {} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f}", plugin, c->colour[0], c->colour[1],
-                                    c->colour[2], c->amount, c->facing, c->softness, c->brightness, c->breakup, c->sparkle, c->snowfall));
+                                    c->colour[2], c->amount, c->facing, c->softness, c->brightness, c->breakup, c->sparkle, c->fall));
         return {};
     }
     ObjectPhysicsClaims physics_claims;
@@ -1545,19 +1546,24 @@ void the_time_of_day_is_read_and_the_cover_melts() {
         assert(reskate.world.controls_text() == "fog=1\nfog_distance=0.5\n")
         assert(reskate.world.set_atmosphere({["Fog.Enable"] = 1, ["Fog.FogColor"] = "0,1450,2500"}))
         assert(not pcall(reskate.world.set_atmosphere, {["Fog.Enable"] = true}), "a value is a number or text")
-        assert(reskate.effects.cover({left = 0.25, snowfall_stopping = true, under_roofs = false}))
+        assert(reskate.effects.cover({left = 0.25, fall_stopping = true, under_roofs = false, light = true}))
         assert(not pcall(reskate.effects.cover, {left = 2}), "left is 0 to 1")
         assert(not pcall(reskate.effects.cover, {under_roofs = 1}), "under_roofs is true or false")
+        assert(not pcall(reskate.effects.cover, {light = "yes"}), "light is true or false")
     )", R"("world.environment", "effects")")});
     running(host, "melt", environment);
-    check(environment.fake.cover_asked && environment.fake.cover_asked->left == 0.25f && environment.fake.cover_asked->snowfall_stopping &&
-              !environment.fake.cover_asked->under_roofs, "a cover's melt is passed on: how much of it is left, and none under roofs");
+    check(environment.fake.cover_asked && environment.fake.cover_asked->left == 0.25f && environment.fake.cover_asked->fall_stopping &&
+              !environment.fake.cover_asked->under_roofs && environment.fake.cover_asked->light,
+          "a cover's melt is passed on: how much of it is left, none under roofs, and light");
     TestEnvironment denied_environment;
     Host denied(denied_environment, Side::client);
     denied.apply({script("melt-denied", R"(
         assert(not pcall(reskate.world.time), "needs world.environment")
+        assert(not pcall(reskate.world.controls_text), "needs world.environment")
+        assert(not pcall(reskate.world.set_atmosphere, {["Fog.Enable"] = 0}), "needs world.environment")
     )")});
     running(denied, "melt-denied", denied_environment);
+    check(denied_environment.fake.atmosphere_set.empty(), "a plugin without world.environment set no atmosphere");
 }
 
 void the_skater_surface_sound_is_set_for_some_fields() {
@@ -1568,6 +1574,11 @@ void the_skater_surface_sound_is_set_for_some_fields() {
         assert(not pcall(reskate.skater.surface_sound, 0xd60, {19}), "fields are 1 to 18")
         assert(not pcall(reskate.skater.surface_sound, 0.5), "a fraction is no surface")
         assert(not pcall(reskate.skater.surface_sound, -1), "a negative is no surface")
+        assert(not pcall(reskate.skater.surface_sound, 116 * 64), "material slot 116 is past the game's grid")
+        assert(not pcall(reskate.skater.surface_sound, 116 * 524288), "property slot 116 is past the game's grid")
+        assert(not pcall(reskate.skater.surface_sound, 0xffffffff), "a word of every bit names no surface")
+        assert(reskate.skater.surface_sound(115 * 64 + 115 * 524288), "the grid's last slots are surfaces")
+        assert(reskate.skater.surface_sound(0xd60, {1, 3}))
     )", R"("skater.control")")});
     running(host, "surface-sound", environment);
     check(environment.fake.surface_set == 0xd60u && environment.fake.surface_fields == 0b101u,
@@ -1593,6 +1604,15 @@ void a_variant_can_wait_for_the_next_launch() {
     running(host, "variant-chooser", environment);
     const std::vector<std::pair<std::string, bool>> expected{{"snowskate", true}, {"standard", false}, {"standard", true}};
     check(environment.fake.chosen_variants == expected, "choose keeps a variant for the next launch only when now is false");
+    // Without the permission it is refused, for the next launch as well as now.
+    TestEnvironment denied_environment;
+    Host denied(denied_environment, Side::client);
+    denied.apply({script("variant-denied", R"(
+        assert(not pcall(reskate.package.choose, "standard", {now = false}), "needs variants")
+        assert(not pcall(reskate.package.choose, "standard"), "needs variants")
+    )")});
+    running(denied, "variant-denied", denied_environment);
+    check(denied_environment.fake.chosen_variants.empty(), "a plugin without variants chose no variant");
 }
 
 void a_plugin_holds_a_trainer_preset() {
@@ -4814,8 +4834,8 @@ void plugins_cover_the_world() {
     Host host(environment, Side::client);
     const auto snow = package("snow", {{manifest_file, manifest(R"("effects")")}, {"plugin/main.lua", R"(
         assert(reskate.effects.cover({colour = {r = 0.9, g = 0.95, b = 1}, amount = 0.8, facing = 0.6, softness = 0.1, brightness = 2,
-            breakup = 0.5, sparkle = 0.25, snowfall = 0.6}))
-        assert(not pcall(reskate.effects.cover, {snowfall = 1.5}), "a snowfall is 0 to 1")
+            breakup = 0.5, sparkle = 0.25, fall = 0.6}))
+        assert(not pcall(reskate.effects.cover, {fall = 1.5}), "a fall is 0 to 1")
         assert(not pcall(reskate.effects.cover, {fall_speed = 9}), "a fall speed is 0.1 to 4")
         assert(not pcall(reskate.effects.cover, {amount = 2}), "an amount is 0 to 1")
         assert(not pcall(reskate.effects.cover, {facing = -0.1}), "a facing is 0 to 1")
@@ -4827,16 +4847,19 @@ void plugins_cover_the_world() {
         assert(reskate.effects.keep_clear({{position = vector.create(1, 2, 3)}, {position = vector.create(4, 5, 6), radius = 1.5, height = 3}}))
         assert(not pcall(reskate.effects.keep_clear, {{position = vector.create(0, 0, 0), radius = 20}}), "a radius is 0.05 to 10")
         assert(not pcall(reskate.effects.keep_clear, {{radius = 1}}), "a place has a position")
-        assert(reskate.effects.keep_clear({{position = vector.create(7, 0, 7), snow = 0.4}}), "snow on what stands in a place")
+        assert(reskate.effects.keep_clear({{position = vector.create(7, 0, 7), dusting = 0.4}}), "a dusting on what stands in a place")
         assert(reskate.effects.keep_clear({{position = vector.create(1, 2, 3)}, {position = vector.create(0, 0, 0), length = 0.8,
-            radius = 0.1, height = 0.05, snow = 0.3, forward = vector.create(2, 1, 0)}}), "a board-shaped place")
+            radius = 0.1, height = 0.05, dusting = 0.3, forward = vector.create(2, 1, 0)}}), "a board-shaped place")
         assert(not pcall(reskate.effects.keep_clear, {{position = vector.create(0, 0, 0), length = 0.8, forward = vector.create(0, 3, 0)}}),
             "a board's forward is not its up")
-        assert(not pcall(reskate.effects.keep_clear, {{position = vector.create(0, 0, 0), snow = 2}}), "a place's snow is 0 to 1")
+        assert(not pcall(reskate.effects.keep_clear, {{position = vector.create(0, 0, 0), dusting = 2}}), "a place's dusting is 0 to 1")
         assert(reskate.effects.trail({position = vector.create(1, 0, 2)}))
         assert(reskate.effects.trail({position = vector.create(1, 0, 3), width = 0.3, fade = 12}))
         assert(reskate.effects.trail({position = vector.create(1, 0, 4), tread = 0.22}), "a trail with a tread")
         assert(not pcall(reskate.effects.trail, {position = vector.create(0, 0, 0), tread = 2}), "a tread is 0 to 1 m")
+        assert(reskate.effects.trail({position = vector.create(1, 0, 6), tread = 0.3, tread_lines = 5}), "a tread of five lines")
+        assert(not pcall(reskate.effects.trail, {position = vector.create(0, 0, 0), tread = 0.3, tread_lines = 40}), "tread_lines is 1 to 31")
+        assert(not pcall(reskate.effects.trail, {position = vector.create(0, 0, 0), tread = 0.3, tread_lines = 2.5}), "tread_lines is whole")
         assert(reskate.effects.trail({position = vector.create(1, 0, 5), starts = true}), "a point starting a new trail")
         assert(not pcall(reskate.effects.trail, {position = vector.create(0, 0, 0), starts = 1}), "starts is true or false")
         assert(not pcall(reskate.effects.trail, {position = vector.create(0, 0, 0), fade = 100}), "a fade is 0.5 to 60 s")
@@ -4860,7 +4883,7 @@ void plugins_cover_the_world() {
     check(game.called("keep clear snow 2 (1.0 2.0 3.0 r0.60 h2.0) (0.0 0.0 0.0 r0.10 h0.1 s0.30 l0.80 f1.0,0.0,0.0 u0.0,1.0,0.0)"),
           "A board-shaped place, its forward made square to its up\n" + environment.all());
     check(game.called("trail snow 1.0 0.0 2.0 w0.25 f10.0") && game.called("trail snow 1.0 0.0 3.0 w0.30 f12.0") &&
-              game.called("trail snow 1.0 0.0 4.0 w0.25 f10.0 t0.22") &&
+              game.called("trail snow 1.0 0.0 4.0 w0.25 f10.0 t0.22x13") && game.called("trail snow 1.0 0.0 6.0 w0.25 f10.0 t0.30x5") &&
               game.called("trail snow 1.0 0.0 5.0 w0.25 f10.0 new"),
           "Trail points, with their defaults\n" + environment.all());
     // A second plugin is told whose cover it is; nil from it does not end the first one's.
@@ -6883,6 +6906,51 @@ void discovery_finds_the_plugins_among_the_mods_left_on() {
     check(again[0].fingerprint != before, "A changed file changes the fingerprint, which reloads it");
 }
 
+// A plugin a dedicated server brought here is the server's: it runs only on servers that require it.
+void a_servers_plugin_runs_only_on_servers_that_require_it() {
+    namespace scope = server_scope;
+    const auto mods = scratch / "server-scope-game" / "Mods";
+    std::filesystem::create_directories(mods);
+    check(scope::read(mods).empty(), "No plugin is a server's before one brings any");
+    check(scope::set(mods, "Team-Drone", true) && scope::set(mods, "neekgate-FPV_Drone", true) && scope::set(mods, "Team-Drone", true),
+          "A plugin a server brought is marked as the server's");
+    const auto marked = scope::read(mods);
+    check(marked == scope::Folders{"team-drone", "neekgate-fpv_drone"}, "The mark is kept by mod folder, whatever its case, once each");
+
+    // The player's own plugins run everywhere, in a session or not.
+    check(scope::runs(marked, {}, "Team-Filmer", "Filmer", "Team") && scope::runs(marked, {"Team-Drone"}, "Team-Filmer", "Filmer", "Team"),
+          "A plugin of the player's own was held back");
+    // A server's own: nowhere but on a server that requires it.
+    check(!scope::runs(marked, {}, "Team-Drone", "Drone", "Team"), "A server's plugin ran outside any server");
+    check(!scope::runs(marked, {"Team-Filmer", "Other-Drone"}, "Team-Drone", "Drone", "Team"),
+          "A server's plugin ran on a server that does not require it");
+    check(scope::runs(marked, {"Team-Filmer", "team-drone"}, "Team-Drone", "Drone", "Team") &&
+              scope::runs(marked, {"Team-Drone-1.2.0"}, "TEAM-DRONE", "", ""),
+          "A server's plugin did not run on a server that requires it");
+    // A package is the mod in its folder, or the one with its name and author (map_download.h).
+    check(scope::names("neekgate-FPV_Drone-2.0.1", "neekgate-FPV_Drone", "", "") && scope::names("neekgate-FPV_Drone", "drone-dev", "FPV_Drone", "Neekgate"),
+          "A required package did not name its plugin");
+    check(!scope::names("neekgate-FPV_Drone", "drone-dev", "FPV_Drone", "") && !scope::names("neekgate-FPV_Drone", "neekgate-FPV", "FPV", "other") &&
+              !scope::names("", "", "", ""),
+          "A required package named a plugin that is not its own");
+    check(scope::runs(marked, {"neekgate-FPV_Drone"}, "neekgate-FPV_Drone", "FPV Drone", "neekgate"), "A marked plugin is known by its folder");
+
+    // The player makes one their own; a mod that is taken out is forgotten.
+    check(scope::set(mods, "TEAM-DRONE", false) && scope::read(mods) == scope::Folders{"neekgate-fpv_drone"}, "A plugin made the player's own stayed the server's");
+    check(scope::runs(scope::read(mods), {}, "Team-Drone", "Drone", "Team"), "and runs everywhere again");
+    scope::keep_only(mods, {"Neekgate-FPV_Drone", "Team-Drone"});
+    check(scope::read(mods).size() == 1, "A plugin still in Mods was forgotten");
+    scope::keep_only(mods, {"Team-Drone"});
+    check(scope::read(mods).empty() && !std::filesystem::exists(mods / scope::file_name), "A plugin taken out of Mods is forgotten, and the file with the last");
+
+    // A file that is not the list marks nothing, so every plugin runs as before.
+    write(mods / scope::file_name, R"({"Team-Drone": true})");
+    check(scope::read(mods).empty(), "A file that is no list marked a plugin");
+    write(mods / scope::file_name, "not json");
+    check(scope::read(mods).empty() && scope::set(mods, "Team-Drone", true) && scope::read(mods) == scope::Folders{"team-drone"},
+          "A broken file is replaced by the next mark");
+}
+
 void discovery_can_recheck_sources_when_mod_metadata_is_unchanged() {
     const auto root = scratch / "same-metadata-game";
     const auto mods = root / "Mods";
@@ -7487,6 +7555,7 @@ int main() {
         run(a_package_with_a_program_or_on_the_wrong_side_is_not_loaded);
         run(discovery_finds_the_plugins_among_the_mods_left_on);
         run(discovery_can_recheck_sources_when_mod_metadata_is_unchanged);
+        run(a_servers_plugin_runs_only_on_servers_that_require_it);
         run(plugins_change_the_games_text);
         run(a_plugin_reads_the_content_folder_it_names);
         run(content_is_read_from_the_mod_folders);
