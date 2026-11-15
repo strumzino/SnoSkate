@@ -280,7 +280,6 @@ struct Shared {
     // and close to the one read from the game.
     std::uint64_t camera_binds{}, camera_distinct{}, camera_reads{}, camera_held{}, camera_close{};
     std::uint64_t camera_binds_most{}, bound_seen_before{}; // the most binds in one frame
-    double camera_ms_total{}, camera_ms_most{}; // the reading's time, over the same frames
     std::array<float, 3> camera_signs{1, 1, 1}; // which way round each of its axes is against ours
     float places_back = camera_delay; // how many frames back the places are taken (the drawn camera's, as found)
     // The places kept clear as each of those frames was drawn, newest first: a place on something that moves
@@ -1013,15 +1012,6 @@ void STDMETHODCALLTYPE hooked_compute_cbv(ID3D12GraphicsCommandList* list, UINT 
 // there were not helped by taking the one most held, 2026-11-14.)
 // Its buffer is read through the GPU memory watch (gpu_diagnostics.h). False when there is none.
 bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
-    // How long the reading takes (the render thread, each frame the cover is drawn), said with the camera line.
-    struct Timed {
-        Shared& s;
-        std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
-        ~Timed() {
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
-            s.camera_ms_total += ms, s.camera_ms_most = std::max(s.camera_ms_most, ms);
-        }
-    } timed{s};
     const auto end = bound_count.load();
     constexpr std::uint64_t looked_most = bound_kept;
     const auto begin = std::max(s.bound_seen, end > looked_most ? end - looked_most : std::uint64_t{0});
@@ -1030,61 +1020,33 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
     s.bound_seen_before = end;
     std::vector<std::array<float, camera_floats>> held; // as the buffers have them, newest first
     std::vector<std::uint64_t> looked; // each address once a frame (the game binds one buffer for many dispatches)
-    // The first 256 bytes of each, searched at every offset: the camera's axes as rows with where it is in the
-    // fourth row (16 bytes in, as found 2026-11-13), or as columns with it in the fourth column, either where it
-    // is or a view matrix's translation (the axes' dot with it, negated). The camera-research build found it at +112
-    // bytes as columns, with where it is in the fourth column, in about nine in ten frames (2026-11-15), and never
-    // at +16 as rows any more.
-    std::array<float, 64> f{};
-    const std::array<float, 3> eye_now{camera[9], camera[10], camera[11]};
-    const auto near_eye = [&](const std::array<float, 3>& e) {
-        for (std::size_t c = 0; c < 3; ++c)
-            if (!std::isfinite(e[c]) || std::abs(e[c] - eye_now[c]) >= 2.0f) return false;
-        return true;
-    };
+    std::array<float, 20> f{};
     for (auto n = end; n > begin; --n) {
         const auto address = bound_addresses[(n - 1) % bound_kept].load(std::memory_order_relaxed);
         ++s.camera_binds;
         if (!address || std::find(looked.begin(), looked.end(), address) != looked.end()) continue;
         looked.push_back(address);
         ++s.camera_distinct;
-        const auto got = overlay::read_gpu_buffer(address, f.data(), sizeof(f)) / sizeof(float);
-        if (got < 16) continue;
+        if (overlay::read_gpu_buffer(address, f.data(), sizeof(f)) < sizeof(f)) continue;
         ++s.camera_reads;
-        for (std::size_t i = 0; i + 15 <= got; ++i) {
-            for (const bool columns : {false, true}) {
-                const std::size_t stride = columns ? 4 : 1, apart = columns ? 1 : 4;
-                std::array<float, camera_floats> one{};
-                bool ok = true;
-                for (std::size_t a = 0; a < 3 && ok; ++a) {
-                    float length = 0;
-                    for (std::size_t c = 0; c < 3; ++c) {
-                        const float v = f[i + a * apart + c * stride];
-                        ok = ok && std::isfinite(v);
-                        length += v * v;
-                        one[a * 3 + c] = v;
-                    }
-                    ok = ok && std::abs(length - 1.0f) < 0.02f;
-                }
-                if (!ok) continue;
-                std::array<float, 3> eye{};
-                int form = -1; // 0 rows, eye in the fourth row; 1 columns, eye in the fourth column; 2 columns, a view's translation
-                if (!columns) {
-                    eye = {f[i + 12], f[i + 13], f[i + 14]};
-                    if (near_eye(eye)) form = 0;
-                } else {
-                    const std::array<float, 3> t{f[i + 3], f[i + 7], f[i + 11]};
-                    if (near_eye(t)) eye = t, form = 1;
-                    else {
-                        for (std::size_t c = 0; c < 3; ++c) eye[c] = -(t[0] * one[c] + t[1] * one[3 + c] + t[2] * one[6 + c]);
-                        if (near_eye(eye)) form = 2;
-                    }
-                }
-                if (form < 0) continue;
-                for (std::size_t c = 0; c < 3; ++c) one[9 + c] = eye[c];
-                held.push_back(one);
+        const float* const rows = f.data() + 4;
+        std::array<float, camera_floats> one{};
+        bool ok = true;
+        for (std::size_t a = 0; a < 3 && ok; ++a) {
+            float length = 0;
+            for (std::size_t c = 0; c < 3; ++c) {
+                const float v = rows[a * 4 + c];
+                ok = ok && std::isfinite(v);
+                length += v * v;
+                one[a * 3 + c] = v;
             }
+            ok = ok && std::abs(length - 1.0f) < 0.02f;
         }
+        for (std::size_t c = 0; c < 3 && ok; ++c) {
+            ok = std::isfinite(rows[12 + c]) && std::abs(rows[12 + c]) < 1e6f;
+            one[9 + c] = rows[12 + c];
+        }
+        if (ok) held.push_back(one);
     }
     s.camera_held += held.size();
     const auto turned = [&](const std::array<float, camera_floats>& one) {
@@ -1275,15 +1237,12 @@ bool record_cover(Shared& s) {
                             static_cast<unsigned long long>(s.camera_close));
         }
         s.camera_binds = s.camera_distinct = s.camera_reads = s.camera_held = s.camera_close = s.camera_binds_most = 0;
-        const double camera_ms = s.camera_ms_total / s.camera_frames, camera_ms_most = s.camera_ms_most;
-        s.camera_ms_total = s.camera_ms_most = 0;
         s.camera_frames = s.game_camera_frames = 0;
         // What it costs: on the GPU a frame, and the roof map's rays on the game's update thread a tick.
         const auto ticks = roof_ticks.exchange(0), rays = roof_rays.exchange(0), roof_us = roof_us_total.exchange(0), roof_most = roof_us_most.exchange(0);
         logging::printf(logging::Level::info, logging::Channel::graphics,
-                        "World cover cost: on the GPU %.2f ms a frame (at most %.2f) over %u frames; reading the game's camera %.3f ms a frame (at most %.3f); "
-                        "the roof map %.2f ms a tick (at most %.2f), %.1f rays a tick, over %llu ticks.",
-                        s.gpu_samples ? s.gpu_ms_total / s.gpu_samples : 0.0, s.gpu_ms_most, s.gpu_samples, camera_ms, camera_ms_most,
+                        "World cover cost: on the GPU %.2f ms a frame (at most %.2f) over %u frames; the roof map %.2f ms a tick (at most %.2f), %.1f rays a tick, over %llu ticks.",
+                        s.gpu_samples ? s.gpu_ms_total / s.gpu_samples : 0.0, s.gpu_ms_most, s.gpu_samples,
                         ticks ? static_cast<double>(roof_us) / 1000.0 / static_cast<double>(ticks) : 0.0, static_cast<double>(roof_most) / 1000.0,
                         ticks ? static_cast<double>(rays) / static_cast<double>(ticks) : 0.0, static_cast<unsigned long long>(ticks));
         s.gpu_ms_total = s.gpu_ms_most = 0;
