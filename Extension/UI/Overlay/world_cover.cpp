@@ -1793,14 +1793,16 @@ void step(const std::array<Camera, camera_history>& history, std::size_t known) 
     }
     // Off for now: it found where the camera is (2026-11-15), and the frame it reads every buffer in hitched.
     constexpr bool searching = false;
-    if (searching && now >= next_at && known == camera_history) {
-        {
-            std::lock_guard lock(bound_mutex);
-            bound.clear();
-            bound_at.clear();
-            binds = 0;
+    if constexpr (searching) {
+        if (now >= next_at && known == camera_history) {
+            {
+                std::lock_guard lock(bound_mutex);
+                bound.clear();
+                bound_at.clear();
+                binds = 0;
+            }
+            taking.store(true);
         }
-        taking.store(true);
     }
 }
 } // namespace camera_search
