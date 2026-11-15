@@ -14,7 +14,6 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -45,16 +44,17 @@ std::filesystem::path breadcrumbs_note() {
     CoTaskMemFree(local);
     return path;
 }
-// A launch count kept in a small file of %LOCALAPPDATA%\ReSkate: how many launches are still to do something.
-int launches_left(const std::filesystem::path& path, int most) {
+int breadcrumbs_left() {
+    const auto path = breadcrumbs_note();
     int left{};
     if (FILE* file{}; !path.empty() && _wfopen_s(&file, path.c_str(), L"r") == 0 && file) {
         if (fscanf_s(file, "%d", &left) != 1) left = 0;
         std::fclose(file);
     }
-    return std::clamp(left, 0, most);
+    return std::clamp(left, 0, breadcrumb_launches);
 }
-void set_launches_left(const std::filesystem::path& path, int left) {
+void set_breadcrumbs_left(int left) {
+    const auto path = breadcrumbs_note();
     if (path.empty()) return;
     std::error_code error;
     if (left <= 0) {
@@ -66,19 +66,6 @@ void set_launches_left(const std::filesystem::path& path, int left) {
         std::fprintf(file, "%d\n", left);
         std::fclose(file);
     }
-}
-int breadcrumbs_left() { return launches_left(breadcrumbs_note(), breadcrumb_launches); }
-void set_breadcrumbs_left(int left) { set_launches_left(breadcrumbs_note(), left); }
-// A plugin's world cover reads the game's camera through the light GPU memory watch, which must be in before the
-// game makes its device to know the game's buffers (D3D12 cannot look a buffer up by its GPU address). So it
-// starts at launch only for a player whose plugins drew a cover in one of the last few launches:
-// %LOCALAPPDATA%\ReSkate\world-cover.txt, how many launches are still to start it. Set again each launch a
-// cover is drawn (watch_gpu_memory_for_cover); a player who has none never has the watch.
-constexpr int cover_launches = 5;
-std::filesystem::path cover_note() {
-    auto path = breadcrumbs_note();
-    if (!path.empty()) path.replace_filename(L"world-cover.txt");
-    return path;
 }
 }
 
@@ -303,11 +290,6 @@ struct Memory {
     std::shared_mutex ranges_mutex;
     std::map<std::uint64_t, std::pair<std::uint64_t, void*>> ranges;
     std::atomic<std::uint64_t> generation{};
-    // Every buffer with its own GPU address, committed or placed (under `mutex`): GPU address -> bytes, object.
-    // read_gpu_buffer finds one in it at once; through the heaps' ranges it went over every resource, and the
-    // camera's read each frame stalled the game (2026-11-13).
-    std::map<std::uint64_t, std::pair<std::uint64_t, void*>> buffers;
-    std::uint64_t buffer_longest{}; // the most bytes of any buffer in it (how far back one can start and still cover an address)
 };
 Memory& gpu_memory() { static auto* value = new Memory; return *value; }
 
@@ -327,11 +309,7 @@ void remove_range(const Allocation& a) {
     m.generation.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Without RESKATE_GPU_DIAGNOSTICS the memory watch is light (world_cover reads the game's camera from its
-// upload buffers): each heap and resource with its GPU addresses, but not the code that made or freed it.
-std::atomic<bool> light_memory{};
 Frames capture_frames() noexcept {
-    if (light_memory.load(std::memory_order_relaxed)) return {};
     Frames frames;
     frames.depth = CaptureStackBackTrace(2, static_cast<DWORD>(frames.at.size()), frames.at.data(), nullptr);
     return frames;
@@ -351,8 +329,6 @@ void note_release(IUnknown* object) noexcept {
         const auto found = m.live.find(object);
         if (found == m.live.end()) return;
         remove_range(found->second);
-        if (const auto buffer = m.buffers.find(found->second.gpu); buffer != m.buffers.end() && buffer->second.second == object)
-            m.buffers.erase(buffer);
         auto& slot = m.freed[m.freed_count++ % freed_kept];
         slot = found->second;
         slot.freed = frames;
@@ -408,8 +384,6 @@ void note_resource(void** out, void* heap, std::uint64_t offset) noexcept {
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             made.bytes = desc.Width;
             made.gpu = resource->GetGPUVirtualAddress();
-        } else if (light_memory.load(std::memory_order_relaxed)) {
-            // (Light: a texture's size is not needed.)
         } else if (auto* const device = gpu_memory().device) {
             // (UINT64_MAX: the runtime could not size it.)
             if (const auto size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes; size != UINT64_MAX) made.bytes = size;
@@ -428,10 +402,6 @@ void note_resource(void** out, void* heap, std::uint64_t offset) noexcept {
             }
         }
         if (!heap) add_range(made);
-        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && made.gpu && made.bytes) {
-            m.buffers[made.gpu] = {made.bytes, object};
-            m.buffer_longest = std::max(m.buffer_longest, made.bytes);
-        }
         m.live[object] = made;
         ++m.made_count;
     } catch (...) {}
@@ -622,12 +592,10 @@ void watch_device_memory(IUnknown* made) noexcept {
         on &= hook_slot(device10.Get(), 77, reinterpret_cast<void*>(&hooked_placed2), original_placed2);
         on &= hook_slot(device10.Get(), 78, reinterpret_cast<void*>(&hooked_reserved2), original_reserved2);
     }
-    const bool light = light_memory.load();
-    if (!light) on &= watch_device_views(device.Get());
+    on &= watch_device_views(device.Get());
     dingosdk::logging::write(on ? dingosdk::logging::Level::info : dingosdk::logging::Level::warning, dingosdk::logging::Channel::graphics,
-        !on ? "GPU diagnostics: some of the GPU memory watch could not start."
-        : light ? "GPU memory watch (light): each GPU heap and buffer's addresses are kept, for a plugin's world cover to read the game's camera."
-                : "GPU diagnostics: the code that makes and frees each GPU heap and resource is kept, for a page fault's report.");
+        on ? "GPU diagnostics: the code that makes and frees each GPU heap and resource is kept, for a page fault's report."
+           : "GPU diagnostics: some of the GPU memory watch could not start.");
 }
 
 using CreateDevice = HRESULT (WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
@@ -1016,27 +984,13 @@ void watch_addresses(ID3D12GraphicsCommandList* list) noexcept {
     SetLastError(error);
 }
 
-namespace {
-std::atomic<bool> memory_watch_started{}; // the hook on D3D12CreateDevice is in (watch_gpu_memory)
-std::atomic<bool> cover_recent{};         // a plugin drew a world cover in one of the last few launches
-}
-bool cover_used_recently() noexcept { return cover_recent.load(); }
 void watch_gpu_memory() noexcept {
+    static std::atomic<bool> started{};
     const auto error = GetLastError();
-    // With the diagnostics, all of it. Without, light, and only for a player whose plugins drew a world cover in a
-    // recent launch (cover_note): what the cover needs to read the game's camera. Anyone else has none of it.
-    const bool diagnostics = graphics_option_enabled(L"RESKATE_GPU_DIAGNOSTICS");
-    int cover_left = 0;
-    try {
-        cover_left = launches_left(cover_note(), cover_launches);
-        if (cover_left > 0) set_launches_left(cover_note(), cover_left - 1);
-    } catch (...) {}
-    cover_recent.store(cover_left > 0);
-    if ((!diagnostics && cover_left <= 0) || memory_watch_started.exchange(true)) {
+    if (!graphics_option_enabled(L"RESKATE_GPU_DIAGNOSTICS") || started.exchange(true)) {
         SetLastError(error);
         return;
     }
-    light_memory.store(!diagnostics);
     // (d3d12.dll is ReSkate's own import, so it is loaded; the game finds D3D12CreateDevice there.)
     auto* const create = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12CreateDevice"));
     void* trampoline{};
@@ -1049,88 +1003,6 @@ void watch_gpu_memory() noexcept {
     original_create_device.store(reinterpret_cast<CreateDevice>(trampoline));
     hook_enable(create);
     SetLastError(error);
-}
-
-namespace {
-// The starts of buffers read_gpu_buffer could not map (not in a CPU-visible heap): not tried again.
-std::mutex unmappable_mutex;
-std::vector<std::uint64_t> unmappable;
-}
-
-void watch_gpu_memory_for_cover(ID3D12Device* device) noexcept {
-    const auto error = GetLastError();
-    try {
-        static std::atomic<bool> noted{};
-        if (!noted.exchange(true)) set_launches_left(cover_note(), cover_launches);
-        // Not in from the start of this launch (no cover in a recent one): light from now on. The game's buffers made
-        // before now are not known, so its camera may be read only from the next launch.
-        if (device && !memory_watch_started.exchange(true)) {
-            light_memory.store(true);
-            watch_device_memory(device);
-        }
-    } catch (...) {}
-    SetLastError(error);
-}
-
-std::size_t read_gpu_buffer(std::uint64_t address, void* out, std::size_t bytes, std::uint64_t* buffer_start,
-                            std::uint64_t* buffer_length) noexcept {
-    try {
-        // The buffers holding the address, from the memory watch. The game's buffers overlap (smaller ones placed
-        // over the memory of a big one): the one starting nearest below the address can end before it while one
-        // starting further back holds it. Taking only that nearest one, the camera was never read (0 of every 600
-        // frames from 2026-11-14 on). So: the one that held it last time first (the game's camera stays in the
-        // same few buffers), then those starting back from the address, as far back as the longest buffer reaches.
-        static std::atomic<std::uint64_t> last_start{};
-        struct Found {
-            std::uint64_t start{}, length{};
-            ComPtr<ID3D12Resource> resource;
-        };
-        std::vector<Found> found;
-        {
-            auto& m = gpu_memory();
-            std::lock_guard lock(m.mutex);
-            const auto take = [&](std::map<std::uint64_t, std::pair<std::uint64_t, void*>>::const_iterator at) {
-                if (address - at->first >= at->second.first) return;
-                {
-                    std::lock_guard bad(unmappable_mutex);
-                    if (std::find(unmappable.begin(), unmappable.end(), at->first) != unmappable.end()) return;
-                }
-                Found f{at->first, at->second.first, {}};
-                if (SUCCEEDED(static_cast<IUnknown*>(at->second.second)->QueryInterface(IID_PPV_ARGS(&f.resource))) && f.resource)
-                    found.push_back(std::move(f));
-            };
-            if (const auto last = last_start.load(); last)
-                if (const auto at = m.buffers.find(last); at != m.buffers.end()) take(at);
-            if (found.empty()) {
-                auto at = m.buffers.upper_bound(address);
-                for (std::size_t looked = 0; at != m.buffers.begin() && looked < 4096 && found.size() < 4; ++looked) {
-                    --at;
-                    if (address - at->first >= m.buffer_longest) break; // none further back reaches it
-                    take(at);
-                }
-            }
-        }
-        for (const auto& f : found) {
-            void* cpu{};
-            if (FAILED(f.resource->Map(0, nullptr, &cpu)) || !cpu) { // (only a CPU-visible heap maps)
-                std::lock_guard lock(unmappable_mutex);
-                if (unmappable.size() < 4096) unmappable.push_back(f.start);
-                continue;
-            }
-            const auto offset = address - f.start;
-            const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, f.length - offset));
-            std::memcpy(out, static_cast<const char*>(cpu) + offset, n);
-            const D3D12_RANGE written{0, 0};
-            f.resource->Unmap(0, &written);
-            last_start.store(f.start);
-            if (buffer_start) *buffer_start = f.start;
-            if (buffer_length) *buffer_length = f.length;
-            return n;
-        }
-        return 0;
-    } catch (...) {
-        return 0;
-    }
 }
 
 void describe_gpu_address(std::uint64_t address) noexcept {

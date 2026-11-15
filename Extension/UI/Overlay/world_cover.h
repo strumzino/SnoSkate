@@ -95,11 +95,11 @@ bool on() noexcept;
 // menus or while a level loads.
 void allow(bool playing) noexcept;
 
-// Render thread (the overlay), with its graphics: the device, the game's queue and where the hooks would go (the
-// queues' and command lists' shared tables, through the overlay's own). Nothing is hooked until a plugin first
-// asks for a cover (set): then ExecuteCommandLists and SetComputeRootConstantBufferView are hooked, in one
-// HookBatch. The shaders compile on a thread of their own then too, or here already when a cover was drawn in one
-// of the last few launches (so it shows at once). A player whose plugins draw no cover has none of it.
+// Render thread (the overlay), with its graphics: the device, the game's queue and where the hook would go (the
+// queues' shared table, through the overlay's own). Nothing is hooked until a plugin first asks for a cover (set):
+// then ExecuteCommandLists is hooked, in a HookBatch. The shaders are compiled (or read from their cache) on a
+// thread of their own then too, or here already for a player whose cache holds an older version of them. A player
+// whose plugins draw no cover has none of it.
 void install(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list) noexcept;
 // Each present, before the overlay draws: a new frame of the game's begins after it. `width` and
 // `height` are the back buffer's.

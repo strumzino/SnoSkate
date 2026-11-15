@@ -4,7 +4,6 @@
 #include "Engine/Core/Hooks/patches.h"
 #include "Engine/Core/Log/logging.h"
 #include "Extension/Plugins/plugin_camera.h"
-#include "Extension/UI/Overlay/gpu_diagnostics.h"
 #include <ShlObj.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -33,7 +32,6 @@ using Microsoft::WRL::ComPtr;
 
 // Slots of the D3D12 interfaces' tables (d3d12.h's declaration order).
 constexpr std::size_t queue_execute = 10;
-constexpr std::size_t list_compute_root_cbv = 37; // SetComputeRootConstantBufferView
 // world_cover.hlsl's cbuffer: seven float4s of camera and look, then the places kept clear (one float4
 // with their count and heights, three with their feet and radii), then last frame's camera (four). A
 // root signature holds 64 values at most, and the descriptor table takes one.
@@ -120,17 +118,6 @@ constexpr std::size_t allocator_count = 16;
 using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 
 std::atomic<ExecuteFn> original_execute{};
-// The game's camera, as it drew the frame: the compute constant buffers it binds at root parameter 0, the last
-// bound_kept of them in turn (a count, and the slot each went into). Tried in the game (2026-11-13): these
-// begin with the camera the frame is drawn with, 16 bytes in, its right, up and back as rows four floats
-// apart and where it is in the fourth row, and are bound before the cover is recorded. The camera the game
-// drew with was 0 to 2 frames older than the newest read from the game, sometimes between two of them, so a
-// fixed delay was right only on average and world-fixed things (trails) still moved a little.
-using RootViewFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
-std::atomic<RootViewFn> original_compute_cbv{};
-constexpr std::size_t bound_kept = 64;
-std::array<std::atomic<std::uint64_t>, bound_kept> bound_addresses{};
-std::atomic<std::uint64_t> bound_count{};
 
 // What a plugin asked for (client thread).
 struct Asked {
@@ -271,15 +258,7 @@ struct Shared {
     // The cameras of this and the last two frames, newest first, and how many are known.
     std::array<std::array<float, camera_floats>, camera_history> cameras{};
     std::size_t cameras_known{};
-    // The game's own camera (game_camera): the binds already looked through, and how many frames found it.
-    std::uint64_t bound_seen{};
-    unsigned game_camera_frames{}, camera_frames{}, camera_reports{};
-    // Where reading it went, over the same 600 frames (said with them): binds looked at, read, holding a camera,
-    // and close to the one read from the game.
-    std::uint64_t camera_binds{}, camera_distinct{}, camera_reads{}, camera_held{}, camera_close{};
-    std::uint64_t camera_binds_most{}, bound_seen_before{}; // the most binds in one frame
-    std::array<float, 3> camera_signs{1, 1, 1}; // which way round each of its axes is against ours
-    float places_back = camera_delay; // how many frames back the places are taken (the drawn camera's, as found)
+    unsigned cost_frames{}; // frames since the cost was last said
     // The places kept clear as each of those frames was drawn, newest first: a place on something that moves
     // (a deck) is drawn where the picture has it, camera_delay back, like the world.
     std::array<std::vector<Clear>, camera_history> clears{};
@@ -327,8 +306,8 @@ Shared& shared() { static auto* value = new Shared; return *value; }
 std::atomic<ID3D12Resource*> main_depth_now{};
 std::atomic<ID3D12Resource*> colour_now{};
 std::atomic<bool> active{}; // wanted, and installed
-// The tables of the runtime's command queues and lists (the overlay's own), where ensure_hooks puts the hooks.
-std::atomic<void**> queue_table{}, list_table{};
+// The table of the runtime's command queues (the overlay's own queue's), where ensure_hooks puts its hook.
+std::atomic<void**> queue_table{};
 // Our own command list: its barriers go through the same hook as the game's and are not the game's.
 std::atomic<ID3D12GraphicsCommandList*> our_list{};
 
@@ -567,11 +546,17 @@ void save_shader_cache(const std::filesystem::path& path, const std::map<std::st
     std::filesystem::rename(partial, path, error);
     if (error) std::filesystem::remove(partial, error);
 }
-bool has_shader_cache() {
+// Whether the cache holds an older version of the shaders and not this one: a player who has drawn a cover
+// before, after the shaders changed. Then they are compiled as the overlay starts (on their own thread), so the
+// cover shows at once when it is asked for. A player who never drew a cover has no cache, and nothing compiles.
+bool older_shader_cache() {
     try {
         std::error_code error;
         const auto path = shader_cache_file();
-        return !path.empty() && std::filesystem::exists(path, error);
+        if (path.empty() || std::filesystem::exists(path, error)) return false;
+        for (const auto& item : std::filesystem::directory_iterator(path.parent_path(), error))
+            if (item.path().filename().wstring().starts_with(L"world-cover-")) return true;
+        return false;
     } catch (...) {
         return false;
     }
@@ -993,133 +978,6 @@ void take_measurements(Shared& s, const std::uint8_t* rows) {
                         best_count, measure_columns);
 }
 
-void STDMETHODCALLTYPE hooked_compute_cbv(ID3D12GraphicsCommandList* list, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
-    original_compute_cbv.load(std::memory_order_relaxed)(list, index, address);
-    if (index != 0 || !active.load(std::memory_order_relaxed)) return;
-    const auto n = bound_count.fetch_add(1, std::memory_order_relaxed);
-    bound_addresses[n % bound_kept].store(address, std::memory_order_relaxed);
-}
-
-// The camera the game drew this frame with, from the compute constant buffers bound since the last frame
-// (the newest 32): those that hold a camera, unit axes as rows from 16 bytes in, where it is in the fourth row.
-// Of those close to `camera` (the one read from the game, delayed: within about 14 degrees and 2 m), the one
-// most of them hold, the newest of any as many: a frame's buffers hold two or three cameras a little apart
-// (the game easing its camera between updates), and with the newest close one, now one, now another, the
-// trails jiggled as the camera moved (2026-11-14). Each axis is taken the way round `camera` has it. (In the
-// replay editor, whose camera read from the game is not the one it draws with, none is close: the trails
-// there were not helped by taking the one most held, 2026-11-14.)
-// Its buffer is read through the GPU memory watch (gpu_diagnostics.h). False when there is none.
-bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
-    const auto end = bound_count.load();
-    // The newest 32 only: the camera is no longer where this looks (camera-research, 2026-11-15), so the delayed
-    // camera is used nearly always, and reading every bind of a frame (100 to 200 buffers) cost the render thread
-    // for nothing.
-    constexpr std::uint64_t looked_most = 32;
-    const auto begin = std::max(s.bound_seen, end > looked_most ? end - looked_most : std::uint64_t{0});
-    s.bound_seen = end;
-    s.camera_binds_most = std::max<std::uint64_t>(s.camera_binds_most, end - s.bound_seen_before);
-    s.bound_seen_before = end;
-    std::vector<std::array<float, camera_floats>> held; // as the buffers have them, newest first
-    std::vector<std::uint64_t> looked; // each address once a frame (the game binds one buffer for many dispatches)
-    std::array<float, 20> f{};
-    for (auto n = end; n > begin; --n) {
-        const auto address = bound_addresses[(n - 1) % bound_kept].load(std::memory_order_relaxed);
-        ++s.camera_binds;
-        if (!address || std::find(looked.begin(), looked.end(), address) != looked.end()) continue;
-        looked.push_back(address);
-        ++s.camera_distinct;
-        if (overlay::read_gpu_buffer(address, f.data(), sizeof(f)) < sizeof(f)) continue;
-        ++s.camera_reads;
-        const float* const rows = f.data() + 4;
-        std::array<float, camera_floats> one{};
-        bool ok = true;
-        for (std::size_t a = 0; a < 3 && ok; ++a) {
-            float length = 0;
-            for (std::size_t c = 0; c < 3; ++c) {
-                const float v = rows[a * 4 + c];
-                ok = ok && std::isfinite(v);
-                length += v * v;
-                one[a * 3 + c] = v;
-            }
-            ok = ok && std::abs(length - 1.0f) < 0.02f;
-        }
-        for (std::size_t c = 0; c < 3 && ok; ++c) {
-            ok = std::isfinite(rows[12 + c]) && std::abs(rows[12 + c]) < 1e6f;
-            one[9 + c] = rows[12 + c];
-        }
-        if (ok) held.push_back(one);
-    }
-    s.camera_held += held.size();
-    const auto turned = [&](const std::array<float, camera_floats>& one) {
-        auto out = one;
-        for (std::size_t a = 0; a < 3; ++a)
-            for (std::size_t c = 0; c < 3; ++c) out[a * 3 + c] *= s.camera_signs[a];
-        return out;
-    };
-    const auto same = [](const std::array<float, camera_floats>& a, const std::array<float, camera_floats>& b) {
-        for (std::size_t k = 0; k < camera_floats; ++k)
-            if (std::abs(a[k] - b[k]) > (k >= 9 ? 0.01f : 0.001f)) return false;
-        return true;
-    };
-    // The one most of `which` hold (newest first, so the newest of any as many), and how many hold it.
-    const auto most_held = [&](const std::vector<std::size_t>& which) {
-        std::size_t best = which.front(), best_count = 0;
-        for (const auto i : which) {
-            std::size_t count = 0;
-            for (const auto j : which) count += same(held[i], held[j]) ? 1 : 0;
-            if (count > best_count) best = i, best_count = count;
-        }
-        return std::pair{best, best_count};
-    };
-    // Those close to the camera read from the game.
-    std::vector<std::size_t> close_ones;
-    std::array<float, 3> close_signs{};
-    for (std::size_t i = 0; i < held.size(); ++i) {
-        const auto& one = held[i];
-        std::array<float, 3> signs{};
-        bool close = true;
-        for (std::size_t a = 0; a < 3 && close; ++a) {
-            float along = 0;
-            for (std::size_t c = 0; c < 3; ++c) along += one[a * 3 + c] * camera[a * 3 + c];
-            signs[a] = along < 0 ? -1.0f : 1.0f;
-            close = along * signs[a] > 0.97f;
-        }
-        for (std::size_t c = 0; c < 3 && close; ++c) close = std::abs(one[9 + c] - camera[9 + c]) < 2.0f;
-        if (!close) continue;
-        if (close_ones.empty()) close_signs = signs;
-        close_ones.push_back(i);
-    }
-    s.camera_close += close_ones.size();
-    if (!close_ones.empty()) {
-        s.camera_signs = close_signs;
-        camera = turned(held[most_held(close_ones).first]);
-        return true;
-    }
-    return false;
-}
-
-// How many frames back the camera the game drew with is among those read from the game (blended between the
-// two nearest), or -1 when it is none of them (the replay editor) or they are all the same (a camera at rest).
-float drawn_frames_back(const Shared& s, const std::array<float, camera_floats>& drawn) {
-    std::array<float, camera_history> off{};
-    for (std::size_t k = 0; k < s.cameras_known; ++k) {
-        float worst = 0;
-        for (std::size_t i = 0; i < camera_floats; ++i)
-            worst = std::max(worst, std::abs(drawn[i] - s.cameras[k][i]) * (i >= 9 ? 0.1f : 1.0f)); // (10 cm as a degree's turn, about)
-        off[k] = worst;
-    }
-    if (s.cameras_known < 2) return -1;
-    const auto nearest = static_cast<std::size_t>(std::min_element(off.begin(), off.begin() + s.cameras_known) - off.begin());
-    const float spread = *std::max_element(off.begin(), off.begin() + s.cameras_known) - off[nearest];
-    if (off[nearest] > 0.05f || spread < 1e-4f) return -1;
-    // Toward the neighbour it is nearer to, by how near.
-    std::size_t other = nearest;
-    if (nearest > 0) other = nearest - 1;
-    if (nearest + 1 < s.cameras_known && (nearest == 0 || off[nearest + 1] < off[nearest - 1])) other = nearest + 1;
-    const float t = off[nearest] / std::max(off[nearest] + off[other], 1e-6f);
-    return static_cast<float>(nearest) + (static_cast<float>(other) - static_cast<float>(nearest)) * t;
-}
-
 bool record_cover(Shared& s) {
     s.why = "nothing to draw into";
     if (s.failed || !s.colour || !s.main_depth) return false;
@@ -1219,26 +1077,11 @@ bool record_cover(Shared& s) {
         const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
         if (length > 1e-6f) v[0] /= length, v[1] /= length, v[2] /= length;
     }
-    // The camera the game drew this frame with, where it can be read; else the delayed one above.
-    const bool own_camera = game_camera(s, camera);
-    s.game_camera_frames += own_camera ? 1 : 0;
-    // The places kept clear (the deck) from the same moment as the camera the game drew with, where it is one
-    // of those read: a fixed delay showed the ground at the deck's front or back as it turned (2026-11-13).
-    if (const float back_found = own_camera ? drawn_frames_back(s, camera) : -1.0f; back_found >= 0) s.places_back = back_found;
-    else if (!own_camera) s.places_back = camera_delay;
-    if (++s.camera_frames >= 600) {
-        if (s.camera_reports < 6) {
-            ++s.camera_reports;
-            logging::printf(logging::Level::info, logging::Channel::graphics,
-                            "World cover: the game's own camera was read in %u of the last 600 frames (else the one %.2f frames back); "
-                            "its binds %llu (at most %llu a frame), different %llu, read %llu, holding a camera %llu, close to ours %llu.",
-                            s.game_camera_frames, camera_delay, static_cast<unsigned long long>(s.camera_binds),
-                            static_cast<unsigned long long>(s.camera_binds_most), static_cast<unsigned long long>(s.camera_distinct),
-                            static_cast<unsigned long long>(s.camera_reads), static_cast<unsigned long long>(s.camera_held),
-                            static_cast<unsigned long long>(s.camera_close));
-        }
-        s.camera_binds = s.camera_distinct = s.camera_reads = s.camera_held = s.camera_close = s.camera_binds_most = 0;
-        s.camera_frames = s.game_camera_frames = 0;
+    // (The camera the game drew with was read from its constant buffers for a while, 2026-11-13 to 11-15. The game
+    // no longer kept that camera where it was read, and the one found in its place was not the one it drew with:
+    // the trails jumped about. The delayed camera alone is steadier, and needs no reading of the game's memory.)
+    if (++s.cost_frames >= 600) {
+        s.cost_frames = 0;
         // What it costs: on the GPU a frame, and the roof map's rays on the game's update thread a tick.
         const auto ticks = roof_ticks.exchange(0), rays = roof_rays.exchange(0), roof_us = roof_us_total.exchange(0), roof_most = roof_us_most.exchange(0);
         logging::printf(logging::Level::info, logging::Channel::graphics,
@@ -1318,7 +1161,7 @@ bool record_cover(Shared& s) {
     for (std::size_t c = camera_history - 1; c > 0; --c) s.clears[c] = std::move(s.clears[c - 1]);
     s.clears[0] = clear;
     {
-        const float places_back = std::min(s.places_back, static_cast<float>(s.cameras_known - 1));
+        const float places_back = std::min(camera_delay, static_cast<float>(s.cameras_known - 1));
         const auto places_at = static_cast<std::size_t>(places_back);
         const float places_blend = places_back - static_cast<float>(places_at);
         const auto& near_one = s.clears[places_at];
@@ -1527,27 +1370,20 @@ bool depth_shaped(const D3D12_RESOURCE_DESC& d, std::uint32_t width, std::uint32
 
 // The cover's hooks and its shaders' compile, the first time a plugin asks for a cover (and the overlay's graphics
 // are up): a player whose plugins draw none has none of them. Installed at the overlay's start, every player had
-// them. Two functions, both through tables every one of the runtime's queues and command lists share (found
-// through the overlay's own): ExecuteCommandLists (the cover's moment) and SetComputeRootConstantBufferView (the
-// game's camera). The game is running by then, so in one HookBatch. Each is hooked where it is; where its code
-// cannot be (Proton's D3D12, vkd3d-proton, refused one on a Steam Deck, 2026-11-13), its slot in the table is
-// pointed at ours instead: calls through the interface, which are what the game makes, come to us the same.
+// them. One function, through the table every one of the runtime's queues shares (found through the overlay's
+// own): ExecuteCommandLists, the cover's moment (the rest it sees through the depth tap's ResourceBarrier hook).
+// The game is running by then, so in a HookBatch. It is hooked where it is; where its code cannot be (Proton's
+// D3D12, vkd3d-proton, refused one on a Steam Deck, 2026-11-13), its slot in the table is pointed at ours instead:
+// calls through the interface, which are what the game makes, come to us the same.
 static void ensure_hooks() noexcept {
     static std::mutex mutex;
     static bool hooked{};
     std::lock_guard once(mutex);
     void** const queues = queue_table.load();
-    void** const lists = list_table.load();
-    if (hooked || !queues || !lists) return;
+    if (hooked || !queues) return;
     hooked = true;
     try {
         start_compiling();
-        ComPtr<ID3D12Device> device;
-        {
-            auto& s = shared();
-            std::lock_guard lock(s.mutex);
-            device = s.device;
-        }
         const auto hook = [](void** table, std::size_t slot, void* detour, auto& original, const char* name) {
             using Fn = std::remove_reference_t<decltype(original.load())>;
             void* const target = table[slot];
@@ -1569,13 +1405,7 @@ static void ensure_hooks() noexcept {
         bool ok = false;
         {
             HookBatch batch;
-            // The GPU memory watch, light, for reading the game's camera (gpu_diagnostics.h): from now on, and
-            // from the start of the next few launches.
-            if (device) overlay::watch_gpu_memory_for_cover(device.Get());
             ok = hook(queues, queue_execute, reinterpret_cast<void*>(&hooked_execute), original_execute, "ExecuteCommandLists");
-            // The game's own camera (game_camera): without it, the delayed camera is used.
-            if (ok) (void)hook(lists, list_compute_root_cbv, reinterpret_cast<void*>(&hooked_compute_cbv), original_compute_cbv,
-                               "SetComputeRootConstantBufferView");
         }
         if (!ok) say_failed("its D3D12 hooks are not all in place.");
         else logging::write(logging::Level::info, logging::Channel::graphics, "World cover: hooks installed, as a plugin asked for a cover.");
@@ -1822,16 +1652,12 @@ void install(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsComm
         s.device = device;
         s.queue = queue;
     }
-    // Only where the hooks would go: they go in when a plugin first asks for a cover (ensure_hooks).
+    // Only where the hook would go: it goes in when a plugin first asks for a cover (ensure_hooks).
     queue_table.store(*reinterpret_cast<void***>(queue));
-    list_table.store(*reinterpret_cast<void***>(list));
-    // A cover drawn in a recent launch: its shaders compile now, on their own thread (no hook, and nothing on the
-    // game's drawing thread), so it shows as soon as a plugin asks for it. Compiled only at the first cover, it
-    // showed a few seconds late each launch (2026-11-15).
-    // A cache of them already on disk is read only when a cover is asked for (it takes no time): with it read here,
-    // as the game started, the game's own pipeline creation failed (E_INVALIDARG) twice in two launches, and in
-    // neither launch without one (2026-11-15). The cause is not known.
-    if (overlay::cover_used_recently() && !has_shader_cache()) start_compiling();
+    // The shaders are compiled (20 to 30 s on a desktop, 2026-11-15), or read from the cache (no time), when a cover
+    // is asked for; ahead, on their own thread, only for a player who has drawn one before and whose cache holds an
+    // older version of them (older_shader_cache).
+    if (older_shader_cache()) start_compiling();
     if (wanted.load()) ensure_hooks(); // a cover asked for before the overlay's graphics were up
 }
 
