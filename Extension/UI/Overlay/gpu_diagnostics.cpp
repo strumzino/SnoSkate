@@ -1014,19 +1014,20 @@ void watch_addresses(ID3D12GraphicsCommandList* list) noexcept {
 
 namespace {
 std::atomic<bool> memory_watch_started{}; // the hook on D3D12CreateDevice is in (watch_gpu_memory)
+std::atomic<bool> cover_recent{};         // a plugin drew a world cover in one of the last few launches
 }
+bool cover_used_recently() noexcept { return cover_recent.load(); }
 void watch_gpu_memory() noexcept {
     const auto error = GetLastError();
     // With the diagnostics, all of it. Without, light, and only for a player whose plugins drew a world cover in a
     // recent launch (cover_note): what the cover needs to read the game's camera. Anyone else has none of it.
     const bool diagnostics = graphics_option_enabled(L"RESKATE_GPU_DIAGNOSTICS");
     int cover_left = 0;
-    if (!diagnostics) {
-        try {
-            cover_left = launches_left(cover_note(), cover_launches);
-            if (cover_left > 0) set_launches_left(cover_note(), cover_left - 1);
-        } catch (...) {}
-    }
+    try {
+        cover_left = launches_left(cover_note(), cover_launches);
+        if (cover_left > 0) set_launches_left(cover_note(), cover_left - 1);
+    } catch (...) {}
+    cover_recent.store(cover_left > 0);
     if ((!diagnostics && cover_left <= 0) || memory_watch_started.exchange(true)) {
         SetLastError(error);
         return;

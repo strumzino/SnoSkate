@@ -1695,6 +1695,10 @@ void install(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsComm
     // Only where the hooks would go: they go in when a plugin first asks for a cover (ensure_hooks).
     queue_table.store(*reinterpret_cast<void***>(queue));
     list_table.store(*reinterpret_cast<void***>(list));
+    // A cover drawn in a recent launch: its shaders compile now, on their own thread (no hook, and nothing on the
+    // game's drawing thread), so it shows as soon as a plugin asks for it. Compiled only at the first cover, it
+    // showed a few seconds late each launch (2026-11-15).
+    if (overlay::cover_used_recently()) start_compiling();
     if (wanted.load()) ensure_hooks(); // a cover asked for before the overlay's graphics were up
 }
 

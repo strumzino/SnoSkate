@@ -39,6 +39,9 @@ void watch_gpu_memory() noexcept;
 // launches start the light watch with the game's device, and if none is on yet it starts now on `device`, the
 // game's (only buffers made from now on are known to it).
 void watch_gpu_memory_for_cover(ID3D12Device* device) noexcept;
+// Whether a plugin drew a world cover in one of the last few launches (read as watch_gpu_memory starts): the
+// cover's shaders are then compiled ahead, so it shows as soon as it is asked for.
+bool cover_used_recently() noexcept;
 void describe_gpu_address(std::uint64_t address) noexcept;
 // With the GPU memory watch on: every GPU address the game binds for a draw or dispatch (vertex and
 // index buffers, root buffer views), puts in a constant-buffer or acceleration-structure view, or
