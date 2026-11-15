@@ -285,6 +285,9 @@ struct Shared {
     std::uint64_t camera_binds_most{}, bound_seen_before{}; // the most binds in one frame
     std::array<std::uint64_t, 3> camera_forms{}; // research: cameras found as rows, columns with the eye, columns of a view
     std::map<std::string, std::uint64_t> camera_offsets; // research: each offset and form found, how often
+    std::string trace_now;                // research: this frame's pick (game_camera)
+    std::vector<std::string> trace;       // research: the frames traced so far this round (camera_trace)
+    unsigned trace_frame{};               // research: frames since the last round began
     std::array<float, 3> camera_signs{1, 1, 1}; // which way round each of its axes is against ours
     float places_back = camera_delay; // how many frames back the places are taken (the drawn camera's, as found)
     // The places kept clear as each of those frames was drawn, newest first: a place on something that moves
@@ -1025,6 +1028,7 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
     s.camera_binds_most = std::max<std::uint64_t>(s.camera_binds_most, end - s.bound_seen_before);
     s.bound_seen_before = end;
     std::vector<std::array<float, camera_floats>> held; // as the buffers have them, newest first
+    std::vector<std::string> held_where; // research: each one's offset and form (+112c)
     std::vector<std::uint64_t> looked; // each address once a frame (the game binds one buffer for many dispatches)
     // The first 256 bytes of each, searched at every offset: the camera's axes as rows with where it is in the
     // fourth row (16 bytes in, as found 2026-11-13), or as columns with it in the fourth column, either where it
@@ -1078,6 +1082,7 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
                 if (form < 0) continue;
                 for (std::size_t c = 0; c < 3; ++c) one[9 + c] = eye[c];
                 held.push_back(one);
+                held_where.push_back(std::format("+{}{}", i * 4, form == 0 ? "r" : form == 1 ? "c" : "v"));
                 ++s.camera_forms[static_cast<std::size_t>(form)];
                 s.camera_offsets[std::format("{}{}", i * 4, form == 0 ? "r" : form == 1 ? "c" : "v")] += 1;
             }
@@ -1124,11 +1129,27 @@ bool game_camera(Shared& s, std::array<float, camera_floats>& camera) {
         close_ones.push_back(i);
     }
     s.camera_close += close_ones.size();
+    // Research: this frame's pick, for the trace (camera_trace): how many close, how many different among them, which
+    // was taken and how many held it, and how far the others were from it (the most of any axis, and metres).
+    s.trace_now.clear();
     if (!close_ones.empty()) {
+        const auto [best, best_count] = most_held(close_ones);
+        std::vector<std::size_t> kinds;
+        float turn_off = 0, move_off = 0;
+        for (const auto i : close_ones) {
+            bool seen_kind = false;
+            for (const auto k : kinds) seen_kind = seen_kind || same(held[i], held[k]);
+            if (!seen_kind) kinds.push_back(i);
+            for (std::size_t k = 0; k < 9; ++k) turn_off = std::max(turn_off, std::abs(std::abs(held[i][k]) - std::abs(held[best][k])));
+            for (std::size_t k = 9; k < 12; ++k) move_off = std::max(move_off, std::abs(held[i][k] - held[best][k]));
+        }
+        s.trace_now = std::format("{} {}/{} of {}", held_where[best], best_count, close_ones.size(), kinds.size());
+        if (kinds.size() > 1) s.trace_now += std::format(" off {:.3f} {:.2f}m", turn_off, move_off);
         s.camera_signs = close_signs;
-        camera = turned(held[most_held(close_ones).first]);
+        camera = turned(held[best]);
         return true;
     }
+    s.trace_now = std::format("none ({} held)", held.size());
     return false;
 }
 
@@ -1258,7 +1279,22 @@ bool record_cover(Shared& s) {
     s.game_camera_frames += own_camera ? 1 : 0;
     // The places kept clear (the deck) from the same moment as the camera the game drew with, where it is one
     // of those read: a fixed delay showed the ground at the deck's front or back as it turned (2026-11-13).
-    if (const float back_found = own_camera ? drawn_frames_back(s, camera) : -1.0f; back_found >= 0) s.places_back = back_found;
+    const float back_found = own_camera ? drawn_frames_back(s, camera) : -1.0f;
+    // Research: 90 frames in a row every 600, each frame's pick and how many frames back of ours it was (or "-" when
+    // it is none of ours), said in lines of 10.
+    if (s.trace_frame++ < 90) {
+        s.trace.push_back(own_camera ? std::format("[{} back {}]", s.trace_now, back_found >= 0 ? std::format("{:.2f}", back_found) : std::string("-"))
+                                     : std::format("[{}: delayed]", s.trace_now));
+        if (s.trace.size() == 10) {
+            std::string line = "World cover (research) trace:";
+            for (const auto& t : s.trace) line += " " + t;
+            logging::write(logging::Level::info, logging::Channel::graphics, line);
+            s.trace.clear();
+        }
+    } else if (s.trace_frame >= 600) {
+        s.trace_frame = 0;
+    }
+    if (back_found >= 0) s.places_back = back_found;
     else if (!own_camera) s.places_back = camera_delay;
     if (++s.camera_frames >= 600) {
         if (s.camera_reports < 6) {
@@ -1755,7 +1791,9 @@ void step(const std::array<Camera, camera_history>& history, std::size_t known) 
         next_at = now + 3000;
         return;
     }
-    if (now >= next_at && known == camera_history) {
+    // Off for now: it found where the camera is (2026-11-15), and the frame it reads every buffer in hitched.
+    constexpr bool searching = false;
+    if (searching && now >= next_at && known == camera_history) {
         {
             std::lock_guard lock(bound_mutex);
             bound.clear();
