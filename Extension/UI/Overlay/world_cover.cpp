@@ -22,12 +22,15 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // world_cover.h says what this does and how it finds its moment in the game's frame.
 namespace dingosdk::world_cover {
+namespace camera_search { void take(int kind, unsigned index, std::uint64_t address) noexcept; } // research, below
 namespace {
 using Microsoft::WRL::ComPtr;
 
@@ -997,6 +1000,7 @@ void take_measurements(Shared& s, const std::uint8_t* rows) {
 
 void STDMETHODCALLTYPE hooked_compute_cbv(ID3D12GraphicsCommandList* list, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
     original_compute_cbv.load(std::memory_order_relaxed)(list, index, address);
+    camera_search::take(0, index, address); // research
     if (index != 0 || !active.load(std::memory_order_relaxed)) return;
     const auto n = bound_count.fetch_add(1, std::memory_order_relaxed);
     bound_addresses[n % bound_kept].store(address, std::memory_order_relaxed);
@@ -1531,6 +1535,204 @@ bool depth_shaped(const D3D12_RESOURCE_DESC& d, std::uint32_t width, std::uint32
 // game's camera). The game is running by then, so in one HookBatch. Each is hooked where it is; where its code
 // cannot be (Proton's D3D12, vkd3d-proton, refused one on a Steam Deck, 2026-11-13), its slot in the table is
 // pointed at ours instead: calls through the interface, which are what the game makes, come to us the same.
+// ---- Research (the camera-research branch, not for merging) ----------------------------------------
+// Where the game's camera is now (2026-11-15: every compute root view 0 bound in a frame was read, and none
+// held a camera close to ours, where on 2026-11-13 nearly every frame's did). Every three seconds one frame's
+// constant buffers, compute and graphics root views of every parameter, are each read twice: as they are bound
+// (on the game's recording thread) and later, as the cover reads them. Each is searched for a camera's axes,
+// as rows or columns, against the cameras of the last frames and the one now; what is found, and whether it
+// was still there when read later, is said in the log.
+namespace camera_search {
+using Camera = std::array<float, camera_floats>; // right, up, back, eye
+constexpr std::size_t read_floats = 64;           // 256 bytes of each buffer
+struct Bound {
+    int kind{};       // 0 compute root view, 1 graphics root view
+    unsigned index{}; // root parameter
+    std::uint64_t address{};
+    std::size_t first{}, count{}; // its first bind in the frame, and how many times
+    std::array<float, read_floats> early{};
+    std::size_t early_floats{};
+};
+std::mutex bound_mutex;
+std::vector<Bound> bound;
+std::map<std::tuple<int, unsigned, std::uint64_t>, std::size_t> bound_at;
+std::size_t binds{};
+std::atomic<bool> taking{};
+void take(int kind, unsigned index, std::uint64_t address) noexcept {
+    if (!taking.load(std::memory_order_relaxed) || !address) return;
+    try {
+        {
+            std::lock_guard lock(bound_mutex);
+            const auto n = binds++;
+            const auto key = std::tuple{kind, index, address};
+            if (const auto at = bound_at.find(key); at != bound_at.end()) {
+                ++bound[at->second].count;
+                return;
+            }
+            if (bound.size() >= 4000) return;
+            bound_at[key] = bound.size();
+            bound.push_back({kind, index, address, n, 1, {}, 0});
+        }
+        std::array<float, read_floats> early{};
+        const auto got = overlay::read_gpu_buffer(address, early.data(), sizeof(early)) / sizeof(float);
+        std::lock_guard lock(bound_mutex);
+        if (const auto at = bound_at.find(std::tuple{kind, index, address}); at != bound_at.end()) {
+            bound[at->second].early = early;
+            bound[at->second].early_floats = got;
+        }
+    } catch (...) {}
+}
+float axis_error(const float* f, std::size_t stride, const float* axis) {
+    float same = 0, flipped = 0;
+    for (std::size_t c = 0; c < 3; ++c) {
+        same = std::max(same, std::abs(f[c * stride] - axis[c]));
+        flipped = std::max(flipped, std::abs(f[c * stride] + axis[c]));
+    }
+    return std::min(same, flipped);
+}
+float matrix_error(const float* f, bool columns, const Camera& c) {
+    const std::size_t stride = columns ? 4 : 1, apart = columns ? 1 : 4;
+    float worst = 0;
+    for (std::size_t a = 0; a < 3; ++a) worst = std::max(worst, axis_error(f + a * apart, stride, c.data() + a * 3));
+    return worst;
+}
+bool rotation_like(const float* f, bool columns) {
+    const std::size_t stride = columns ? 4 : 1, apart = columns ? 1 : 4;
+    for (std::size_t a = 0; a < 3; ++a) {
+        float length = 0;
+        for (std::size_t c = 0; c < 3; ++c) {
+            const float v = f[a * apart + c * stride];
+            if (!std::isfinite(v)) return false;
+            length += v * v;
+        }
+        if (std::abs(length - 1.0f) > 0.02f) return false;
+    }
+    return true;
+}
+// The best camera match at each offset of `f` (rows or columns): its error and which camera.
+struct Hit {
+    std::size_t offset{};
+    bool columns{};
+    float error{};
+    std::size_t camera{};
+};
+std::vector<Hit> hits(const float* f, std::size_t n, const std::vector<std::pair<std::string, Camera>>& cameras) {
+    std::vector<Hit> out;
+    for (std::size_t i = 0; i + 12 <= n; ++i)
+        for (const bool columns : {false, true}) {
+            if (!rotation_like(f + i, columns)) continue;
+            Hit h{i, columns, 1e9f, 0};
+            for (std::size_t k = 0; k < cameras.size(); ++k)
+                if (const float e = matrix_error(f + i, columns, cameras[k].second); e < h.error) h.error = e, h.camera = k;
+            out.push_back(h);
+        }
+    return out;
+}
+void search(std::vector<Bound> seen, std::size_t total, const std::vector<std::pair<std::string, Camera>>& cameras) {
+    std::size_t early_read = 0, late_read = 0, rotations = 0, early_matches = 0, late_matches = 0;
+    struct Line {
+        float error{};
+        std::string text;
+    };
+    std::vector<Line> lines;
+    std::array<float, read_floats> late{};
+    for (const auto& b : seen) {
+        std::uint64_t start{}, length{};
+        const auto late_floats = overlay::read_gpu_buffer(b.address, late.data(), sizeof(late), &start, &length) / sizeof(float);
+        early_read += b.early_floats ? 1 : 0;
+        late_read += late_floats ? 1 : 0;
+        const auto early_hits = hits(b.early.data(), b.early_floats, cameras);
+        const auto late_hits = hits(late.data(), late_floats, cameras);
+        rotations += early_hits.size();
+        for (const auto& h : early_hits) {
+            if (h.error < 0.02f) ++early_matches;
+            // Still there later: the same offset and layout, and the same camera as near.
+            float late_error = 1e9f;
+            std::size_t late_camera = 0;
+            for (const auto& l : late_hits)
+                if (l.offset == h.offset && l.columns == h.columns) late_error = l.error, late_camera = l.camera;
+            if (late_error < 0.02f) ++late_matches;
+            if (h.error > 0.1f) continue; // (only near ones are listed)
+            std::string text = std::format("{} {} at +{} bytes ({}), buffer of {} bytes at +{}, bound {} time(s), first at bind {} of {}: as bound, {} {:.4f}; "
+                                           "as the cover reads it, {}",
+                                           b.kind == 0 ? "compute root view" : "graphics root view", b.index, h.offset * 4, h.columns ? "columns" : "rows",
+                                           length, b.address - start, b.count, b.first, total, cameras[h.camera].first, h.error,
+                                           late_error < 1e8f ? std::format("{} {:.4f}", cameras[late_camera].first, late_error) : std::string("no rotation there"));
+            if (!h.columns && h.offset + 15 <= b.early_floats) {
+                const auto& c = cameras[h.camera].second;
+                text += std::format("; its fourth row {:.2f} {:.2f} {:.2f}, the eye {:.2f} {:.2f} {:.2f}", b.early[h.offset + 12], b.early[h.offset + 13],
+                                    b.early[h.offset + 14], c[9], c[10], c[11]);
+            }
+            lines.push_back({h.error, std::move(text)});
+        }
+    }
+    std::sort(lines.begin(), lines.end(), [](const Line& a, const Line& b) { return a.error < b.error; });
+    logging::printf(logging::Level::info, logging::Channel::graphics,
+                    "Camera search: %zu binds, %zu different constant buffers in a frame; read as bound %zu, as the cover reads %zu; %zu rotations as bound, "
+                    "%zu of them a camera of ours (within 0.02), %zu still that camera when the cover reads it.",
+                    total, seen.size(), early_read, late_read, rotations, early_matches, late_matches);
+    std::set<std::string> said;
+    std::size_t shown = 0;
+    for (const auto& l : lines) {
+        if (shown >= 24) break;
+        // One line for each kind of place: drop the bind numbers and buffer offsets when comparing.
+        const auto key = l.text.substr(0, l.text.find(", buffer of"));
+        if (!said.insert(key).second) continue;
+        ++shown;
+        logging::write(logging::Level::info, logging::Channel::graphics, "Camera search:   " + l.text);
+    }
+}
+// Each present while the cover is drawn: one frame in every three seconds is taken.
+void step(const std::array<Camera, camera_history>& history, std::size_t known) {
+    static std::uint64_t next_at{};
+    static bool started{};
+    const auto now = GetTickCount64();
+    if (!started) {
+        started = true;
+        logging::write(logging::Level::info, logging::Channel::graphics, "Camera search: on (research build).");
+        next_at = now + 5000;
+    }
+    if (taking.load()) {
+        taking.store(false);
+        std::vector<Bound> seen;
+        std::size_t total{};
+        {
+            std::lock_guard lock(bound_mutex);
+            seen.swap(bound);
+            bound_at.clear();
+            total = std::exchange(binds, 0);
+        }
+        std::vector<std::pair<std::string, Camera>> cameras;
+        for (std::size_t k = 0; k < known; ++k) cameras.push_back({std::format("the camera {} frame(s) back", k), history[k]});
+        if (const auto view = plugin_camera::camera_now()) {
+            const auto& w = view->world;
+            cameras.push_back({"the camera now", Camera{w[0], w[1], w[2], w[4], w[5], w[6], w[8], w[9], w[10], w[12], w[13], w[14]}});
+        }
+        try {
+            search(std::move(seen), total, cameras);
+        } catch (...) {}
+        next_at = now + 3000;
+        return;
+    }
+    if (now >= next_at && known == camera_history) {
+        {
+            std::lock_guard lock(bound_mutex);
+            bound.clear();
+            bound_at.clear();
+            binds = 0;
+        }
+        taking.store(true);
+    }
+}
+} // namespace camera_search
+// Research: graphics root constant buffer views too (SetGraphicsRootConstantBufferView, the lists' slot 38).
+constexpr std::size_t list_graphics_root_cbv = 38;
+std::atomic<RootViewFn> original_graphics_cbv{};
+void STDMETHODCALLTYPE hooked_graphics_cbv(ID3D12GraphicsCommandList* list, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    original_graphics_cbv.load(std::memory_order_relaxed)(list, index, address);
+    camera_search::take(1, index, address);
+}
+
 static void ensure_hooks() noexcept {
     static std::mutex mutex;
     static bool hooked{};
@@ -1575,6 +1777,8 @@ static void ensure_hooks() noexcept {
             // The game's own camera (game_camera): without it, the delayed camera is used.
             if (ok) (void)hook(lists, list_compute_root_cbv, reinterpret_cast<void*>(&hooked_compute_cbv), original_compute_cbv,
                                "SetComputeRootConstantBufferView");
+            if (ok) (void)hook(lists, list_graphics_root_cbv, reinterpret_cast<void*>(&hooked_graphics_cbv), original_graphics_cbv,
+                               "SetGraphicsRootConstantBufferView"); // research
         }
         if (!ok) say_failed("its D3D12 hooks are not all in place.");
         else logging::write(logging::Level::info, logging::Channel::graphics, "World cover: hooks installed, as a plugin asked for a cover.");
@@ -1869,6 +2073,7 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
                            "World cover: the world's last drawing was in the frame's last batch, so the cover had no place before post-processing.");
         }
         s.width = width, s.height = height;
+        camera_search::step(s.cameras, s.cameras_known); // research
         s.main_missed = s.main_seen ? 0 : s.main_missed + 1;
         // How this frame went, counted; every 600 frames (the first eight times) said in the log.
         if (s.main_depth) {
