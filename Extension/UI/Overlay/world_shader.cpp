@@ -304,7 +304,8 @@ struct Shared {
     // the picture, its state after, its format.
     std::uint64_t finished_frame{~std::uint64_t{0}};
     std::uint64_t written_frame{~std::uint64_t{0}}; // the frame the locked kind's picture was last drawn into
-    unsigned unlocked_waited{}; // frames the shader waited for the world's picture to be chosen (at most 120, once)
+    unsigned unlocked_waited{};
+    unsigned depth_copies{}; // copies of the depth taken this frame (more than one: it became readable more than once) // frames the shader waited for the world's picture to be chosen (at most 120, once)
     ID3D12Resource* finished_picture{};
     D3D12_RESOURCE_STATES finished_state{};
     DXGI_FORMAT finished_format{};
@@ -900,6 +901,7 @@ bool snapshot_depth(Shared& s, ID3D12CommandQueue* queue, ExecuteFn original) {
     queue->Signal(s.fence.Get(), ++s.fence_value);
     s.allocator_fence[at] = s.fence_value;
     s.depth_copied_frame = s.frame;
+    ++s.depth_copies;
     return true;
 }
 
@@ -1669,14 +1671,13 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         if (s.main_depth) {
             ++s.outcomes[s.drawn ? "drawn" : !s.tried ? "the frame's last batch (to the screen) not seen" : (s.why ? s.why : "not drawn")];
             if (!s.drawn && !s.tried && s.finished_frame != s.frame) ++s.outcomes["no finished picture seen this frame"];
+            if (s.depth_copies > 1) ++s.outcomes["the depth copied more than once"];
             if (++s.outcome_frames >= 600) {
                 // Said whenever a frame of them went without the shader (a blink of it, 2026-11-16), else the first
                 // eight times at debug.
-                // (And any drawn with an older copy of the depth: the camera moved since, and the shader is drawn a
-                // little off for those frames, as when the game makes its depth anew.)
-                const auto drawn = s.outcomes.find("drawn");
-                const bool missed = drawn == s.outcomes.end() || drawn->second < s.outcome_frames ||
-                                    s.outcomes.contains("drawn with the last frame's depth");
+                // Any frame not plainly drawn: one without it, one drawn with an older copy of the depth, or into a
+                // picture found another way (the snow vanished for an instant on frames counted as drawn, 2026-11-16).
+                const bool missed = s.outcomes.size() > 1 || !s.outcomes.contains("drawn");
                 if (missed || s.outcome_reports < 8) {
                     if (!missed) ++s.outcome_reports;
                     std::string line = "World shader: the last 600 frames:";
@@ -1718,6 +1719,7 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
             s.frames_voted = 0;
         }
         s.frame_last = 0;
+        s.depth_copies = 0;
         s.locked_seen = false;
         s.pending = s.drawn = s.depth_elsewhere = s.unsafe = s.main_seen = false;
         s.colour_state_known = false;
