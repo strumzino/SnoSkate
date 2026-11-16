@@ -1672,8 +1672,11 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
             if (++s.outcome_frames >= 600) {
                 // Said whenever a frame of them went without the shader (a blink of it, 2026-11-16), else the first
                 // eight times at debug.
+                // (And any drawn with an older copy of the depth: the camera moved since, and the shader is drawn a
+                // little off for those frames, as when the game makes its depth anew.)
                 const auto drawn = s.outcomes.find("drawn");
-                const bool missed = drawn == s.outcomes.end() || drawn->second < s.outcome_frames;
+                const bool missed = drawn == s.outcomes.end() || drawn->second < s.outcome_frames ||
+                                    s.outcomes.contains("drawn with the last frame's depth");
                 if (missed || s.outcome_reports < 8) {
                     if (!missed) ++s.outcome_reports;
                     std::string line = "World shader: the last 600 frames:";
