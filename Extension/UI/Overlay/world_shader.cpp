@@ -303,6 +303,8 @@ struct Shared {
     // was not the one that takes the screen to a render target (it came in an earlier batch): the frame it was seen in,
     // the picture, its state after, its format.
     std::uint64_t finished_frame{~std::uint64_t{0}};
+    std::uint64_t written_frame{~std::uint64_t{0}}; // the frame the locked kind's picture was last drawn into
+    unsigned unlocked_waited{}; // frames the shader waited for the world's picture to be chosen (at most 120, once)
     ID3D12Resource* finished_picture{};
     D3D12_RESOURCE_STATES finished_state{};
     DXGI_FORMAT finished_format{};
@@ -365,15 +367,29 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
         // 600 at times, 2026-11-16). The picture an earlier batch of this frame finished is the one, in the state
         // that batch left it in.
         const bool finished_before = !composite && to_screen && s.finished_frame == s.frame && s.finished_picture;
-        if ((composite || finished_before) && !s.drawn) {
+        // And with no finished picture seen at all this frame (8 frames in the first 600 after the shader came on,
+        // 2026-11-16): the picture of the kind locked onto, drawn into this frame, in the state the lists so far left it.
+        const bool locked_written = !composite && !finished_before && to_screen && s.locked && s.written_frame == s.frame && s.colour &&
+                                    s.colour_state_known;
+        // Nothing until the world's picture is chosen (30 frames, locked), for at most 120 frames once: drawn into
+        // whatever came first, the shader came on and went off again for a few frames as it settled. (Where it never
+        // locks, it draws as before after that.)
+        if ((composite || finished_before || locked_written) && !s.drawn && !s.locked && s.unlocked_waited < 120) {
+            ++s.unlocked_waited;
             s.tried = true;
-            s.colour = composite ? composite->final_picture : s.finished_picture;
-            s.colour_state = composite ? composite->final_before : s.finished_state;
-            s.colour_state_known = true;
-            const DXGI_FORMAT final_format = composite ? composite->final_format : s.finished_format;
+            s.why = "the world's picture not chosen yet";
+        } else if ((composite || finished_before || locked_written) && !s.drawn) {
+            s.tried = true;
+            if (!locked_written) {
+                s.colour = composite ? composite->final_picture : s.finished_picture;
+                s.colour_state = composite ? composite->final_before : s.finished_state;
+                s.colour_state_known = true;
+            }
+            const DXGI_FORMAT final_format = composite ? composite->final_format : finished_before ? s.finished_format : s.colour_format;
             if (s.chosen_format == DXGI_FORMAT_UNKNOWN) s.chosen_format = final_format;
             s.colour_format = s.chosen_format;
             if (finished_before) ++s.outcomes["the picture finished in an earlier batch"];
+            if (locked_written) ++s.outcomes["the locked picture, none finished seen"];
             s.why = s.unsafe ? "a split or aliasing barrier, or another queue" : s.depth_elsewhere ? "the depth moved on another queue"
                   : final_format != s.chosen_format ? "the final picture in another format" : nullptr;
             const bool drew = !s.why && record_shader(s);
@@ -419,6 +435,7 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             if (n.world) {
                 s.colour = n.colour;
                 s.pending = !s.drawn;
+                if (s.locked) s.written_frame = s.frame;
             }
             if (n.colour_state_known && n.colour && n.colour == s.colour) {
                 s.colour_state_known = true;
