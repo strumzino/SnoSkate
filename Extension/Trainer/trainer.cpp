@@ -3372,6 +3372,17 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
         if (action == "apply") {
             std::string why;
             if (!editable(&why)) return "error: " + why;
+            // One of the player's own presets at a time: loading one turns off any other of theirs that is on (its
+            // values put back first), so MY PRESETS shows only the one loaded as on. Before, the one loaded before stayed
+            // ON beside it. Built-in presets stay on with it, as their values say.
+            const auto own = [&](std::string_view preset) {
+                return std::ranges::any_of(s.user, [&](const auto &user) { return ascii_lower(user.first) == ascii_lower(preset); });
+            };
+            if (own(name)) {
+                const auto on = s.active;
+                for (const auto &other : on)
+                    if (own(other) && ascii_lower(other) != ascii_lower(name)) (void)remove_preset(other);
+            }
             return apply_preset(name);
         }
         if (action == "save") {
