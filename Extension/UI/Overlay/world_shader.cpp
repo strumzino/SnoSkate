@@ -174,7 +174,7 @@ struct Notes {
     // being written to being read: that picture, its format, and its state before this list.
     bool composite{};
     ID3D12Resource* final_picture{};
-    D3D12_RESOURCE_STATES final_before{};
+    D3D12_RESOURCE_STATES final_before{}, final_after{};
     DXGI_FORMAT final_format{};
 };
 struct Shared {
@@ -299,6 +299,13 @@ struct Shared {
     bool tried{};               // the shader's moment came this frame
     std::map<std::string, unsigned> outcomes;
     unsigned outcome_frames{}, outcome_reports{};
+    // The finished scene's picture as a list of this frame's moved it from being written to being read, when that list
+    // was not the one that takes the screen to a render target (it came in an earlier batch): the frame it was seen in,
+    // the picture, its state after, its format.
+    std::uint64_t finished_frame{~std::uint64_t{0}};
+    ID3D12Resource* finished_picture{};
+    D3D12_RESOURCE_STATES finished_state{};
+    DXGI_FORMAT finished_format{};
 };
 Shared& shared() { static auto* value = new Shared; return *value; }
 
@@ -346,19 +353,29 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
         // (traced 2026-11-10: the screen PRESENT to render target, the 1920x1080 R11G11B10 scene and the
         // RGBA8 UI layer read, the screen back to PRESENT, all in one batch of one list).
         const Notes* composite{};
+        bool to_screen = false; // a list of the batch takes the screen to a render target
         for (UINT i = 0; i < count && !composite; ++i) {
             const auto found = s.notes.find(static_cast<ID3D12GraphicsCommandList*>(lists[i]));
-            if (found != s.notes.end() && found->second.composite && found->second.final_picture) composite = &found->second;
+            if (found == s.notes.end() || !found->second.composite) continue;
+            to_screen = true;
+            if (found->second.final_picture) composite = &found->second;
         }
-        if (composite && !s.drawn) {
+        // The screen's batch without the finished picture's barrier on it: on some frames the game moves the picture
+        // to being read in an earlier batch of its own, and the shader went without that frame (a blink, 8 frames in
+        // 600 at times, 2026-11-16). The picture an earlier batch of this frame finished is the one, in the state
+        // that batch left it in.
+        const bool finished_before = !composite && to_screen && s.finished_frame == s.frame && s.finished_picture;
+        if ((composite || finished_before) && !s.drawn) {
             s.tried = true;
-            s.colour = composite->final_picture;
-            s.colour_state = composite->final_before;
+            s.colour = composite ? composite->final_picture : s.finished_picture;
+            s.colour_state = composite ? composite->final_before : s.finished_state;
             s.colour_state_known = true;
-            if (s.chosen_format == DXGI_FORMAT_UNKNOWN) s.chosen_format = composite->final_format;
+            const DXGI_FORMAT final_format = composite ? composite->final_format : s.finished_format;
+            if (s.chosen_format == DXGI_FORMAT_UNKNOWN) s.chosen_format = final_format;
             s.colour_format = s.chosen_format;
+            if (finished_before) ++s.outcomes["the picture finished in an earlier batch"];
             s.why = s.unsafe ? "a split or aliasing barrier, or another queue" : s.depth_elsewhere ? "the depth moved on another queue"
-                  : composite->final_format != s.chosen_format ? "the final picture in another format" : nullptr;
+                  : final_format != s.chosen_format ? "the final picture in another format" : nullptr;
             const bool drew = !s.why && record_shader(s);
             if (drew) {
                 s.drawn = true;
@@ -385,6 +402,13 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
                 depth_finished = true; // copied once this batch has run, if it is readable now
             }
             if (n.unsafe) s.unsafe = true;
+            // A finished picture on a list that is not the screen's: kept for the screen's batch, if it comes later.
+            if (n.final_picture && !n.composite) {
+                s.finished_frame = s.frame;
+                s.finished_picture = n.final_picture;
+                s.finished_state = n.final_after;
+                s.finished_format = n.final_format;
+            }
             // A picture counts only once the world's depth is done and readable: one written before
             // that is not the lit world (the game writes one then, and the shader could never read the
             // depth at its moment, 2026-11-10). The last one written after it is kept for the vote.
@@ -1627,6 +1651,7 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         // How this frame went, counted; every 600 frames (the first eight times) said in the log.
         if (s.main_depth) {
             ++s.outcomes[s.drawn ? "drawn" : !s.tried ? "the frame's last batch (to the screen) not seen" : (s.why ? s.why : "not drawn")];
+            if (!s.drawn && !s.tried && s.finished_frame != s.frame) ++s.outcomes["no finished picture seen this frame"];
             if (++s.outcome_frames >= 600) {
                 // Said whenever a frame of them went without the shader (a blink of it, 2026-11-16), else the first
                 // eight times at debug.
@@ -1783,6 +1808,7 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
                         d.MipLevels == 1 && d.DepthOrArraySize == 1) {
                         n.final_picture = resource;
                         n.final_before = b.Transition.StateBefore;
+                        n.final_after = b.Transition.StateAfter;
                         n.final_format = f;
                     }
                 }
