@@ -3483,7 +3483,7 @@ struct WorldApi {
     // screen.shader(file, values): the plugin's own pixel shader (a file in its package: .hlsl, or a compiled .cso,
     // .dxbc or .dxil; Extension/UI/Overlay/screen_shader_file.h says what it is given) over the game's picture for
     // 0.3 s, so every tick; nil ends it. `values`: up to 48 numbers, the shader's reskate_values (four to a float4).
-    // One plugin's at a time. True, or nil and why it is not drawn (another plugin's is on, or this one did not
+    // One plugin's at a time. True, or false and why it is not drawn (another plugin's is on, or this one did not
     // compile, was refused or took too long on the GPU, which keeps it off for the run). A file that is not a screen
     // shader at all, or values that are not numbers, are an error.
     // A shader's numbers (screen.shader's and world.shader's values): up to 48, finite.
@@ -3533,7 +3533,7 @@ struct WorldApi {
     }
     // world.shader(file, {values = {...}, heights = bool}): the plugin's own pixel shader in the game's lit picture of
     // the world, before its UI (Extension/UI/Overlay/world_shader.h says what it is given), on until nil. One plugin's at
-    // a time. `heights`: the ground heights round the camera are measured for it (t3). True, or nil and why it is not
+    // a time. `heights`: the ground heights round the camera are measured for it (t3). True, or false and why it is not
     // drawn; a file that is not a shader at all, or options that are not as said, are an error.
     static int world_shader_set(lua_State* L) {
         auto& plugin = plugin_of(L);
