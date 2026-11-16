@@ -65,8 +65,9 @@ cbuffer ReSkateWorld : register(b0) {
                                  // data's float4s (t2), 1 while the ground heights (t3) are measured
     float4 reskate_values[12];   // the plugin's (reskate.world.shader's values, four to a float4)
     float4 reskate_light;        // the picture's brightness (its luminance, averaged over 32 points), eased over about half
-                                 // a second; this frame's own; 1 once measured; the open sky's (the game's fog and sky),
-                                 // eased over about 4 s and kept while none is in view, 0 until seen
+                                 // a second; this frame's own; 1 once measured; the open sky's (taken once, then eased over
+                                 // about 30 s, kept while none is in view, taken afresh as the world's depth is made anew),
+                                 // 0 until seen
 };
 Texture2D<float4> reskate_picture : register(t0);
 Texture2D<float> reskate_depth : register(t1);

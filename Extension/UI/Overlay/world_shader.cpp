@@ -265,7 +265,7 @@ struct Shared {
     // The picture's brightness (reskate_light): the last measured, and eased over about half a second, and when.
     float light_raw{}, light{};
     bool light_known{};
-    float far_light{}; // the open sky's, eased over about 4 s, kept while none is in view
+    float far_light{}; // the open sky's, taken the first time, then eased over about 30 s, kept while none is in view
     bool far_known{};
     std::uint64_t light_at_us{};
     // The shader's time on the GPU: a timestamp before and after each allocator's list, read back when it is free,
@@ -1119,9 +1119,11 @@ void take_light(Shared& s, const std::uint8_t* rows) {
     if (!n) return;
     const float raw = std::max(static_cast<float>(sum / n), 1e-5f);
     const std::uint64_t now = now_us();
-    // The open sky's, eased over about 4 s, and kept while none is on the screen (looking at the ground): so a fog drawn
-    // with it stays the same as the camera turns. With the whole picture's, it got lighter and darker with what was in
-    // view (2026-11-16).
+    // The open sky's: taken as it is the first time, then eased over about 30 s, and kept while none is on the screen
+    // (looking at the ground): so a fog drawn with it stays the same as the camera turns, and follows only the light's own
+    // changes (a time of day, when the world's depth is made anew, takes it afresh). The game's sky is not as bright
+    // everywhere (lighter near the horizon), and eased over 2 to 4 s it still rose and fell as the camera panned up and
+    // down; with the whole picture's, with what was in view (2026-11-16).
     if (far_n >= 2) {
         const float far_raw = std::max(static_cast<float>(far_sum / far_n), 1e-5f);
         if (!s.far_known) {
@@ -1129,7 +1131,7 @@ void take_light(Shared& s, const std::uint8_t* rows) {
             s.far_known = true;
         } else {
             const float seconds = std::clamp(static_cast<float>(now - s.light_at_us) / 1e6f, 0.0f, 1.0f);
-            s.far_light = std::exp(std::log(s.far_light) + (std::log(far_raw) - std::log(s.far_light)) * std::min(seconds / 4.0f, 1.0f));
+            s.far_light = std::exp(std::log(s.far_light) + (std::log(far_raw) - std::log(s.far_light)) * std::min(seconds / 30.0f, 1.0f));
         }
     }
     if (!s.light_known) {
@@ -1391,10 +1393,12 @@ bool record_shader(Shared& s) {
                    height_most = height_us_most.exchange(0);
         logging::printf(logging::Level::info, logging::Channel::graphics,
                         "World shader cost: on the GPU %.2f ms a frame (at most %.2f) over %u frames; the ground heights %.2f ms a tick (at most %.2f), "
-                        "%.1f rays a tick, over %llu ticks.",
+                        "%.1f rays a tick, over %llu ticks. The light given: the picture's %.4f (this frame %.4f), the sky's %.4f%s.",
                         s.gpu_samples ? s.gpu_ms_total / s.gpu_samples : 0.0, s.gpu_ms_most, s.gpu_samples,
                         ticks ? static_cast<double>(height_us) / 1000.0 / static_cast<double>(ticks) : 0.0, static_cast<double>(height_most) / 1000.0,
-                        ticks ? static_cast<double>(rays) / static_cast<double>(ticks) : 0.0, static_cast<unsigned long long>(ticks));
+                        ticks ? static_cast<double>(rays) / static_cast<double>(ticks) : 0.0, static_cast<unsigned long long>(ticks),
+                        static_cast<double>(s.light), static_cast<double>(s.light_raw), static_cast<double>(s.far_light),
+                        s.far_known ? "" : " (no sky seen yet)");
         s.gpu_ms_total = s.gpu_ms_most = 0;
         s.gpu_samples = 0;
     }
@@ -2739,6 +2743,7 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
         // A new main depth buffer (a resize, a level): its views are looked for afresh; and the game has made its pictures
         // anew too, so the screen's ones known from before are forgotten.
         s.finals = {};
+        s.far_known = false; // (the sky's light taken afresh: a time of day changed, most often)
         if (s.main_depth_hold) s.retiring.push_back({s.fence_value, s.main_depth_hold});
         s.main_depth_hold = resource;
         s.main_depth = resource;
