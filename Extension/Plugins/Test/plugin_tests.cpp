@@ -4754,7 +4754,7 @@ void plugins_run_a_screen_shader() {
         assert(reskate.screen.shader("shaders/tint.hlsl"))
         assert(reskate.screen.shader(nil))
         local ok, why = reskate.screen.shader("shaders/slow.hlsl")
-        assert(ok == nil and why:find("on the GPU"), tostring(why))
+        assert(ok == false and why:find("on the GPU"), tostring(why))
         local too_many = {}
         for i = 1, 49 do too_many[i] = 0 end
         assert(not pcall(reskate.screen.shader, "shaders/tint.hlsl", too_many), "at most 48 values")
