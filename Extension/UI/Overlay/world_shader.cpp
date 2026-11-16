@@ -194,6 +194,9 @@ struct Notes {
     bool drawn_inside{}; // the plugin's shader was drawn on this list itself (draw_inside)
     std::size_t inside_slot{}; // and in which of the draws inside (inside_ring)
     const char* inside_why{}; // why it was not, where it was looked at
+    // How much the game had recorded on this list (the calls followed, ListState::calls) when it finished the picture of
+    // the kind locked onto, or -1 when that is not known.
+    long long calls_at_finish{-1};
 };
 struct Shared {
     std::mutex mutex;
@@ -351,9 +354,12 @@ struct Shared {
     ID3D12Resource* finished_first{};   // the first picture it finished (of any kind)
     unsigned finished_said{};           // such frames said in the log (the first 12)
     const char* finished_why{};         // whether the shader was drawn inside that list, or why not
-    // The pictures the screen's list has finished (the final scene's: the game takes turns with two), the last four.
-    std::array<ID3D12Resource*, 4> finals{};
-    std::size_t finals_next{};
+    long long finished_calls{-1};       // how much that list had recorded when it finished the picture
+    // How much the screen's list has recorded when it finishes the picture, on the frames it does (most): the most of the
+    // last 120, and how many were seen. A list that finishes it with far more recorded drew it itself.
+    std::deque<long long> screen_calls;
+    long long screen_calls_most{};
+    unsigned screen_calls_seen{};
 };
 Shared& shared() { static auto* value = new Shared; return *value; }
 // A short name for a list or a picture in the trace: L1, L2, ... and P1, P2, ... in the order seen. Under the lock.
@@ -436,12 +442,11 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             const auto found = s.notes.find(static_cast<ID3D12GraphicsCommandList*>(lists[i]));
             if (found == s.notes.end() || !found->second.composite) continue;
             to_screen = true;
-            // The picture the screen's list finished: one the screen takes (the game takes turns with two), kept for
-            // draw_inside's choice.
-            if (const auto final_picture = found->second.final_picture;
-                final_picture && std::find(s.finals.begin(), s.finals.end(), final_picture) == s.finals.end()) {
-                s.finals[s.finals_next] = final_picture;
-                s.finals_next = (s.finals_next + 1) % s.finals.size();
+            if (found->second.final_picture && found->second.calls_at_finish >= 0) {
+                s.screen_calls.push_back(found->second.calls_at_finish);
+                while (s.screen_calls.size() > 120) s.screen_calls.pop_front();
+                s.screen_calls_most = *std::max_element(s.screen_calls.begin(), s.screen_calls.end());
+                ++s.screen_calls_seen;
             }
             if (found->second.final_picture) composite = &found->second;
         }
@@ -479,10 +484,10 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
                     logging::printf(logging::Level::info, logging::Channel::graphics,
                                     "World shader: the picture finished in an earlier batch (frame %llu): %u of the kind locked onto finished on "
                                     "that list; drawn into the last of them (%p, state 0x%x), the first finished was %p, the last written %p; "
-                                    "not drawn inside that list: %s.",
+                                    "not drawn inside that list: %s (%lld calls recorded on it, the screen's list at most %lld).",
                                     static_cast<unsigned long long>(s.active_frames), s.finished_count, static_cast<void*>(s.finished_picture),
                                     static_cast<unsigned>(s.finished_state), static_cast<void*>(s.finished_first), static_cast<void*>(last_written),
-                                    s.finished_why ? s.finished_why : "not looked at");
+                                    s.finished_why ? s.finished_why : "not looked at", s.finished_calls, s.screen_calls_most);
                 }
             }
             if (locked_written) ++s.outcomes["the locked picture, none finished seen"];
@@ -528,6 +533,7 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
                 s.finished_count = n.finished_count;
                 s.finished_first = n.final_picture;
                 s.finished_why = n.drawn_inside ? "drawn inside it" : n.inside_why ? n.inside_why : "not looked at";
+                s.finished_calls = n.calls_at_finish;
             }
             // A picture counts only once the world's depth is done and readable: one written before
             // that is not the lit world (the game writes one then, and the shader could never read the
@@ -2531,30 +2537,29 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
                         n.final_before = b.Transition.StateBefore;
                         n.final_after = b.Transition.StateAfter;
                         n.final_format = f;
-                    }
-                    if (finished && !n.composite && f != DXGI_FORMAT_UNKNOWN && d.Width == s.depth_width && d.Height == s.depth_height &&
-                        d.MipLevels == 1 && d.DepthOrArraySize == 1) {
+                        // Finished on a list before the screen's barrier (on this list or any): there may be no moment
+                        // between batches before the game reads it, so the shader is drawn here, on this list, just before
+                        // the game's barrier. Only the kind locked onto, once the world's depth is done, once a frame.
                         const std::uint64_t kind = std::uint64_t{static_cast<std::uint32_t>(f)} | (std::uint64_t{static_cast<std::uint32_t>(d.Flags)} << 8) |
                                                    ((b.Transition.StateBefore & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ? (std::uint64_t{1} << 40) : 0);
-                        if (!s.locked || kind == s.locked) {
-                            n.last_picture = resource;
-                            n.last_after = b.Transition.StateAfter;
-                            n.last_format = f;
-                            ++n.finished_count;
-                        }
-                        // One of the pictures the screen takes (the final scene's, as the screen's list has finished it on the
-                        // frames before), finished on a list before the screen's barrier: there may be no moment between
-                        // batches before the game reads it, so the shader is drawn here, on this list, just before the game's
-                        // barrier. Every finished one is looked at, not only a list's first. Only those: the game finishes
-                        // pictures of the same kind on the way (the lit scene, before more passes and the water and glass
-                        // drawn into the final one), and drawn into the first of them on every frame, the water drawn after
-                        // it covered the shader, in a square (2026-11-16).
-                        const bool final_one = std::find(s.finals.begin(), s.finals.end(), resource) != s.finals.end();
                         const auto depth_state = n.depth_state_known ? n.depth_state : s.depth_state;
                         const bool depth_done = (n.depth_state_known || s.depth_state_known) && (depth_state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) &&
                                                 !(depth_state & D3D12_RESOURCE_STATE_DEPTH_WRITE);
-                        if (s.locked && kind == s.locked && final_one && !n.drawn_inside) {
-                            n.inside_why = s.drawn || s.inside_frame == s.frame ? "already drawn this frame"
+                        // Only on a list that drew the picture itself: on most frames the picture is finished at the start of the
+                        // screen's list, drawn in an earlier one, and the moment between batches before it is the right one.
+                        // How much the game had recorded on this list by now, against what it has when it finishes the picture at
+                        // the start of the screen's list (most frames, learnt from them): far more is the list that drew it.
+                        const auto known_list = list_states.find(list);
+                        const long long calls = known_list != list_states.end() && known_list->second.complete
+                                                    ? static_cast<long long>(known_list->second.calls) : -1;
+                        if (kind == s.locked) n.calls_at_finish = calls;
+                        const bool learnt = s.screen_calls_seen >= 60;
+                        const bool written_here = learnt && calls > s.screen_calls_most * 2 + 16;
+                        if (!n.composite && s.locked && kind == s.locked) {
+                            n.inside_why = calls < 0 ? "its state on that list not all known"
+                                         : !learnt ? "not learnt yet how much the screen's list records first"
+                                         : !written_here ? "too little recorded on that list before it"
+                                         : s.drawn || s.inside_frame == s.frame ? "already drawn this frame"
                                          : !depth_done ? "the depth not done"
                                          : s.unsafe || n.unsafe || s.depth_elsewhere ? "a split or aliasing barrier, or another queue"
                                          : b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ? "a barrier on one subresource"
@@ -2568,8 +2573,17 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
                                     n.inside_why = "its state on that list not all known, or not ready";
                                 }
                             }
-                        } else if (s.locked && kind == s.locked && !final_one && !n.inside_why) {
-                            n.inside_why = "not a picture the screen takes";
+                        }
+                    }
+                    if (finished && !n.composite && f != DXGI_FORMAT_UNKNOWN && d.Width == s.depth_width && d.Height == s.depth_height &&
+                        d.MipLevels == 1 && d.DepthOrArraySize == 1) {
+                        const std::uint64_t kind = std::uint64_t{static_cast<std::uint32_t>(f)} | (std::uint64_t{static_cast<std::uint32_t>(d.Flags)} << 8) |
+                                                   ((b.Transition.StateBefore & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ? (std::uint64_t{1} << 40) : 0);
+                        if (!s.locked || kind == s.locked) {
+                            n.last_picture = resource;
+                            n.last_after = b.Transition.StateAfter;
+                            n.last_format = f;
+                            ++n.finished_count;
                         }
                     }
                 }
