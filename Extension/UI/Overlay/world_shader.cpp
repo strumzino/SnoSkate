@@ -1628,11 +1628,15 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         if (s.main_depth) {
             ++s.outcomes[s.drawn ? "drawn" : !s.tried ? "the frame's last batch (to the screen) not seen" : (s.why ? s.why : "not drawn")];
             if (++s.outcome_frames >= 600) {
-                if (s.outcome_reports < 8) {
-                    ++s.outcome_reports;
+                // Said whenever a frame of them went without the shader (a blink of it, 2026-11-16), else the first
+                // eight times at debug.
+                const auto drawn = s.outcomes.find("drawn");
+                const bool missed = drawn == s.outcomes.end() || drawn->second < s.outcome_frames;
+                if (missed || s.outcome_reports < 8) {
+                    if (!missed) ++s.outcome_reports;
                     std::string line = "World shader: the last 600 frames:";
                     for (const auto& [what, count] : s.outcomes) line += std::format(" {} {};", what, count);
-                    logging::write(logging::Level::debug, logging::Channel::graphics, line);
+                    logging::write(missed ? logging::Level::info : logging::Level::debug, logging::Channel::graphics, line);
                 }
                 s.outcomes.clear();
                 s.outcome_frames = 0;
