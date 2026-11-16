@@ -221,6 +221,19 @@ struct Shared {
     ID3D12Resource* candidate{};
     std::uint64_t candidate_frame{};
     unsigned candidate_run{};
+    // The world's depth's partner: for a while after a time of day changes, the game draws the world into two depth
+    // buffers of the same size by turns, one each frame. The candidate above never had three frames in a row, the
+    // shader went without a copy of the depth every other frame (294 of 600, the snow and the rain flicking off) until
+    // the 300 presents a smaller one waits, and then took the 960x540 one and back (2026-11-16). One finished in the
+    // frames between the main one's, three times running, is its partner: whichever of the two is finished in a
+    // frame is the main one for it. Let go once not finished for `partner_lost` frames.
+    ID3D12Resource* partner{};
+    ComPtr<ID3D12Resource> partner_hold;
+    std::uint64_t partner_frame{}; // the frame the partner was last finished
+    ID3D12Resource* turns{};      // one seen taking turns with the main one, not yet its partner
+    std::uint64_t turns_frame{};
+    unsigned turns_run{};
+    bool said_partner{};
     bool unsafe{};         // this frame's colour or depth went through a split or aliasing barrier
     bool pending{};        // the world was drawn in a submitted batch, the shader not yet
     bool drawn{};          // the shader is drawn this frame
@@ -363,6 +376,15 @@ struct Shared {
     std::size_t finals_next{};
 };
 Shared& shared() { static auto* value = new Shared; return *value; }
+constexpr std::uint64_t partner_lost = 8;
+// Under the lock: no partner, and none being watched for (its reference let go once the GPU is done with it).
+void forget_partner(Shared& s) {
+    if (s.partner_hold) s.retiring.push_back({s.fence_value, s.partner_hold});
+    s.partner_hold.Reset();
+    s.partner = nullptr;
+    s.turns = nullptr;
+    s.turns_run = 0;
+}
 // A short name for a list or a picture in the trace: L1, L2, ... and P1, P2, ... in the order seen. Under the lock.
 std::string trace_name(Shared& s, const void* what, char kind) {
     const auto found = s.trace_ids.find(what);
@@ -2334,6 +2356,7 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
                 s.main_depth = nullptr;
                 s.candidate = nullptr;
                 s.candidate_run = 0;
+                forget_partner(s);
                 s.finals = {}; // (pictures known from before are not trusted after a rest)
                 s.far_known = false; // (and the sky's light settles afresh when it is back)
                 main_depth_now.store(nullptr);
@@ -2361,6 +2384,8 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         }
         s.last_present_us = now_us();
         s.main_missed = s.main_seen ? 0 : s.main_missed + 1;
+        // The game back to one depth buffer: the partner is let go.
+        if (s.partner && s.frame > s.partner_frame + partner_lost) forget_partner(s);
         // How this frame went, counted; every 600 frames (the first eight times) said in the log.
         if (s.main_depth) {
             ++s.outcomes[s.drawn ? "drawn" : !s.tried ? "the frame's last batch (to the screen) not seen" : (s.why ? s.why : "not drawn")];
@@ -2512,6 +2537,7 @@ void release() noexcept {
         s.main_depth = nullptr;
         s.candidate = nullptr;
         s.candidate_run = 0;
+        forget_partner(s);
         s.main_depth_hold.Reset();
         main_depth_now.store(nullptr);
         s.depth_state_known = false;
@@ -2733,6 +2759,45 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
         // half a second meanwhile was taken first, and the snow thinned out until the real one came
         // (2026-11-12).
         const bool same_size = desc.Width == s.depth_width && desc.Height == s.depth_height;
+        // Two taking turns (Shared::partner): the partner finished in a frame the main one has not been is the main
+        // one now, and the other its partner; nothing else changes (the same pictures, the same sky).
+        if (s.main_depth && same_size && resource != s.main_depth && !s.main_seen) {
+            bool take = resource == s.partner;
+            if (!take && s.main_missed == 0) {
+                // The main one finished last frame, this one now: taking turns, if it keeps on every other frame.
+                if (resource == s.turns && s.turns_frame + 2 == s.frame) ++s.turns_run;
+                else if (resource != s.turns || s.turns_frame != s.frame) s.turns = resource, s.turns_run = 1;
+                s.turns_frame = s.frame;
+                if (s.turns_run >= 3) {
+                    if (s.partner_hold) s.retiring.push_back({s.fence_value, s.partner_hold});
+                    s.partner_hold = resource;
+                    s.partner = resource;
+                    s.turns = nullptr;
+                    s.turns_run = 0;
+                    take = true;
+                    if (!s.said_partner) {
+                        s.said_partner = true;
+                        logging::write(logging::Level::info, logging::Channel::graphics,
+                                       "World shader: the game draws the world's depth into two buffers by turns; both are followed.");
+                    }
+                }
+            }
+            if (take) {
+                std::swap(s.main_depth, s.partner);
+                std::swap(s.main_depth_hold, s.partner_hold);
+                s.partner_frame = s.frame - 1; // (the one let go of now was finished last frame)
+                main_depth_now.store(resource);
+                s.candidate = nullptr;
+                s.candidate_run = 0;
+                s.depth_state_known = false;
+                s.main_seen = true;
+                s.main_missed = 0;
+                auto& n = s.notes[list];
+                n.depth_state_known = true;
+                n.depth_state = b.Transition.StateAfter;
+                return;
+            }
+        }
         if (s.main_depth && same_size && resource != s.main_depth) {
             if (resource != s.candidate) s.candidate = resource, s.candidate_run = 1;
             else if (s.candidate_frame + 1 == s.frame) ++s.candidate_run;
@@ -2752,6 +2817,7 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
         s.finals = {};
         s.far_known = false; // (the sky's light taken afresh: a time of day changed, most often)
         if (s.main_depth_hold) s.retiring.push_back({s.fence_value, s.main_depth_hold});
+        forget_partner(s);
         s.main_depth_hold = resource;
         s.main_depth = resource;
         main_depth_now.store(resource);
