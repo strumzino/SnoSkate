@@ -531,6 +531,10 @@ float measure_at(float3 target) {
 float ps_measure(Interpolated input) : SV_Target {
     const uint k = (uint)input.position.x;
     if (anchor.w < 0.5) return 0;
+    // Not with the camera looking steeply down (or up) the column: its points then lie over each other on screen, on the
+    // skater's head and shoulders, nearer than themselves, and enough of them agreed on a near distance too short to be
+    // held (a dark ball before the camera as it panned down, until it was learnt again, 2026-11-16).
+    if (abs(back_height.y) > 0.6) return 0;
     const float side = (k < 16u ? -0.06 : 0.06);
     return measure_at(anchor.xyz + float3(0, -0.4 + (k % 16u) * 0.13, 0) + right_focal.xyz * side);
 }
