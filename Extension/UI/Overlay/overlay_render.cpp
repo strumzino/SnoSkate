@@ -7,6 +7,7 @@
 #include "plugin_overlay.h"
 #include "screen_look.h"
 #include "screen_shader.h"
+#include "world_shader.h"
 #include "viewmodel.h"
 #include "park_previews.h"
 #include "chat_emotes.h"
@@ -105,6 +106,7 @@ void destroy_graphics() {
     store_icons_lost();
     screen_look::release();
     screen_shader::release();
+    world_shader::release();
     viewmodel::release();
     s.commands.Reset(); s.rtvs.Reset(); s.srvs.Reset(); s.fence.Reset(); s.device.Reset();
     if (s.fence_event) CloseHandle(s.fence_event);
@@ -383,6 +385,7 @@ bool setup_graphics() {
     dingosdk::overlay::watch_draws(s.commands.Get());
     dingosdk::overlay::watch_addresses(s.commands.Get());
     install_depth_tap(s.commands.Get());
+    world_shader::install(s.device.Get(), s.queue.Get(), s.commands.Get());
     s.fence->SetName(L"ReSkate overlay fence");
     s.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!s.fence_event) return false;
@@ -786,6 +789,11 @@ void render(IDXGISwapChain* presented, UINT flags) {
             s.next_setup_attempt = now + std::chrono::milliseconds(250);
             return;
         }
+    }
+    // A plugin's world shader (reskate.world.shader): the game's next frame begins after this present.
+    if (s.swapchain) {
+        DXGI_SWAP_CHAIN_DESC world_chain{};
+        if (SUCCEEDED(s.swapchain->GetDesc(&world_chain))) world_shader::present(world_chain.BufferDesc.Width, world_chain.BufferDesc.Height);
     }
     // Keep swapchain/window selection, initialization, stop and resize/fence
     // handling alive while hidden, but do no per-frame UI or backbuffer work --

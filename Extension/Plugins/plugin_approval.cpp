@@ -76,6 +76,7 @@ constexpr Capability capabilities[] = {
     {"hud.score", "SCREEN", Risk::amber, "Show its own tricks and points in skate.'s score HUD"},
     {"overlay", "SCREEN", Risk::amber, "Draw on your screen, with screen effects, toasts and x-ray view"},
     {"screen.shader", "SCREEN", Risk::red, "Run its own shader on your graphics card, over your whole screen"},
+    {"world.shader", "SCREEN", Risk::red, "Run its own shader on your graphics card, drawing into the game's world"},
     {"ui.screen", "SCREEN", Risk::grey, "Open its own screens and dialogs"},
     {"ui.models", "SCREEN", Risk::grey, "Send numbers to its own mod's menus and HUD"},
     {"menu", "SCREEN", Risk::grey, "Edit the game's menu and add its own menu page"},
@@ -310,6 +311,7 @@ std::string approval_prompt(const std::vector<PermissionGroup>& groups) {
             if (has("hud.score")) actions.push_back("show its own tricks and points in skate.'s score HUD (they never count)");
             if (has("overlay")) actions.push_back("draw on screen, including screen effects");
             if (has("screen.shader")) actions.push_back("run its own shader over your whole screen");
+            if (has("world.shader")) actions.push_back("run its own shader drawing into the game's world");
             if (has("ui.screen")) actions.push_back("open plugin screens and dialogs");
             if (has("ui.models")) actions.push_back("send numbers to its own mod's menus and HUD");
             if (has("menu")) actions.push_back("edit the game's menu and add menu pages");

@@ -78,6 +78,7 @@
 #include "Extension/UI/Overlay/overlay.h"
 #include "Extension/UI/Overlay/screen_look.h"
 #include "Extension/UI/Overlay/screen_shader.h"
+#include "Extension/UI/Overlay/world_shader.h"
 #include "Extension/UI/Overlay/viewmodel.h"
 #include "Extension/UI/Overlay/scripted_pad.h"
 #include "Engine/Game/Input/pad_output.h"
@@ -1273,6 +1274,18 @@ public:
         }
         return screen_shader::set(plugin, shader->file, shader->bytes, shader->kind, shader->values);
     }
+    std::string world_shader(std::string_view plugin, std::optional<WorldShader> shader) override {
+        if (!shader) {
+            world_shader::clear(plugin);
+            return {};
+        }
+        return world_shader::set(plugin, shader->file, shader->bytes, shader->kind, shader->values, shader->heights);
+    }
+    std::string world_shader_data(std::string_view plugin, std::shared_ptr<const std::string> bytes) override {
+        return world_shader::set_data(plugin, std::move(bytes));
+    }
+    void world_shader_anchor(std::string_view plugin, std::optional<Vec3> at) override { world_shader::set_anchor(plugin, at); }
+    std::optional<double> world_shader_cost(std::string_view plugin) override { return world_shader::cost_ms(plugin); }
     // ---- viewmodel -----------------------------------------------------------------------------------
     std::string viewmodel_load(std::string_view plugin, const std::filesystem::path& file) override {
         if (!viewmodeler_.empty() && viewmodeler_ != plugin) return viewmodeler_ + " has the viewmodel";
@@ -1928,6 +1941,10 @@ public:
         return camera_shown_ ? std::string{} : camera_status_.empty() ? "waiting for the game's camera" : camera_status_;
     }
     void apply_camera(std::uintptr_t base, std::uintptr_t client, bool ready, bool phase) {
+        // A plugin's world shader only over a level in play, with no game menu open (world_shader.h); and in the
+        // replay editor, whose picture is the world, though the game counts it a menu.
+        const bool replay = base && multiplayer::replay_editor_open(base);
+        world_shader::allow(base && ((ready && !multiplayer::sample_game_ui_state(base).in_menu) || replay));
         if (multiplayer::party_spectating()) {
             // Spectate has the lease now, and gives the game's camera back itself.
             camera_shown_ = camera_releasing_ = false;
@@ -2044,6 +2061,7 @@ public:
             looker_.clear();
         }
         screen_shader::clear(plugin);
+        world_shader::clear(plugin);
         if (viewmodeler_ == plugin) {
             viewmodel::unload();
             viewmodeler_.clear();

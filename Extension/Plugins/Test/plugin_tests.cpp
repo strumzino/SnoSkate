@@ -705,6 +705,25 @@ struct FakeGame final : Game {
         if (s->file == "shaders/slow.hlsl") return "it took 9.00 ms a frame on the GPU (at most 3.0)";
         return {};
     }
+    std::string world_shader(std::string_view plugin, std::optional<WorldShader> s) override {
+        if (!s) {
+            calls.push_back(std::format("world {} none", plugin));
+            return {};
+        }
+        calls.push_back(std::format("world {} {} {} {} {} {:.2f} {:.2f}", plugin, s->file, static_cast<int>(s->kind), s->bytes ? s->bytes->size() : 0,
+                                    s->heights, s->values[0], s->values[47]));
+        return {};
+    }
+    std::string world_shader_data(std::string_view plugin, std::shared_ptr<const std::string> bytes) override {
+        float first = 0;
+        if (bytes && bytes->size() >= 4) std::memcpy(&first, bytes->data(), 4);
+        calls.push_back(bytes ? std::format("world data {} {} {:.2f}", plugin, bytes->size(), first) : std::format("world data {} none", plugin));
+        return {};
+    }
+    void world_shader_anchor(std::string_view plugin, std::optional<Vec3> at) override {
+        calls.push_back(at ? std::format("world anchor {} {:.1f} {:.1f} {:.1f}", plugin, (*at)[0], (*at)[1], (*at)[2]) : std::format("world anchor {} none", plugin));
+    }
+    std::optional<double> world_shader_cost(std::string_view) override { return 4.5; }
     std::string screen_look(std::string_view plugin, std::optional<ScreenLook> l) override {
         calls.push_back(l ? std::format("look {} {:.2f} {:.0f} {:.2f} {}{}{}{}{}{}{}{}{}{}{} {:.1f} [{}|{}|{}|{}|{}]", plugin, l->bend, l->fov, l->age, l->bars, l->hood,
                                         l->grade, l->soft, l->scanlines, l->grain, l->dropouts, l->head_switching, l->tracking, l->smear, l->iris, l->rolling,
@@ -4766,6 +4785,61 @@ void plugins_run_a_screen_shader() {
     check(!game.called("shader sneaky"), "Nothing of a plugin without it reaches the game");
 }
 
+// reskate.world.shader: the plugin's file checked as a screen shader's is, its values and heights, its data as a buffer
+// of float4s, its anchor and its cost; refused without "world.shader" ("screen.shader" is not enough).
+void plugins_run_a_world_shader() {
+    TestEnvironment environment;
+    auto& game = environment.fake;
+    Host host(environment, Side::client);
+    const std::map<std::string, std::string> files{
+        {manifest_file, manifest(R"("world.shader")")},
+        {"shaders/snow.hlsl", "float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return reskate_picture.Sample(reskate_point, uv); }"},
+        {"shaders/snow.dxil", shader_container("DXIL", 0x00000060)},
+        {"shaders/vertex.dxil", shader_container("DXIL", 0x00010060)},
+        {"plugin/main.lua", R"(
+        local values = {}
+        for i = 1, 48 do values[i] = i / 2 end
+        assert(reskate.world.shader("shaders/snow.hlsl", {values = values, heights = true}))
+        assert(reskate.world.shader("shaders/snow.dxil"))
+        local data = buffer.create(32)
+        buffer.writef32(data, 0, 1.5)
+        assert(reskate.world.shader_data(data))
+        assert(reskate.world.shader_data(nil))
+        reskate.world.shader_anchor(vector.create(1, 2, 3))
+        reskate.world.shader_anchor(nil)
+        assert(reskate.world.shader_cost() == 4.5)
+        assert(not pcall(reskate.world.shader_data, buffer.create(20)), "whole float4s")
+        assert(not pcall(reskate.world.shader_data, buffer.create(65536 + 16)), "at most 64 KB")
+        assert(not pcall(reskate.world.shader_data, "not a buffer"), "a buffer")
+        assert(not pcall(reskate.world.shader, "shaders/snow.hlsl", {heights = "yes"}), "heights is true or false")
+        assert(not pcall(reskate.world.shader, "shaders/snow.hlsl", {values = {"a"}}), "values are numbers")
+        assert(not pcall(reskate.world.shader, "shaders/vertex.dxil"), "a pixel shader")
+        assert(not pcall(reskate.world.shader_anchor, "here"), "an anchor is a position")
+        assert(reskate.world.shader(nil))
+        reskate.log("snowed")
+    )"}};
+    host.apply({package("world", files)});
+    ticks(host, environment, 1);
+    running(host, "world", environment);
+    check(environment.logged("[world] snowed"), "A world shader's calls work\n" + environment.all());
+    check(game.called(std::format("world world shaders/snow.hlsl 0 {} true 0.50 24.00", files.at("shaders/snow.hlsl").size())),
+          "HLSL reaches the game with its values and the heights asked for\n" + environment.all());
+    check(game.called(std::format("world world shaders/snow.dxil 2 {} false 0.00 0.00", files.at("shaders/snow.dxil").size())),
+          "DXIL reaches the game as DXIL, with no heights unless asked\n" + environment.all());
+    check(game.called("world data world 32 1.50") && game.called("world data world none"), "Its data as float4s, and none");
+    check(game.called("world anchor world 1.0 2.0 3.0") && game.called("world anchor world none"), "Its anchor, and none");
+    check(game.called("world world none"), "nil ends it");
+    check(!game.called("world data world 20") && !game.called("shaders/vertex.dxil"), "Data and files that are not right never reach the game");
+    host.apply({package("sneaky", {{manifest_file, manifest(R"("screen.shader")")}, {"shaders/snow.hlsl", files.at("shaders/snow.hlsl")}, {"plugin/main.lua", R"(
+        reskate.log("world " .. tostring(pcall(reskate.world.shader, "shaders/snow.hlsl")) .. " " .. tostring(pcall(reskate.world.shader_data, nil)) .. " " ..
+            tostring(pcall(reskate.world.shader_anchor, nil)) .. " " .. tostring(pcall(reskate.world.shader_cost)))
+    )"}})});
+    ticks(host, environment, 1);
+    check(environment.logged("[sneaky] world false false false false"), "world.shader is needed\n" + environment.all());
+    check(!game.called("world sneaky") && !game.called("world data sneaky") && !game.called("world anchor sneaky"),
+          "Nothing of a plugin without it reaches the game");
+}
+
 void plugins_reach_cruise_and_read_the_mouse() {
     TestEnvironment environment;
     auto& game = environment.fake;
@@ -7425,6 +7499,7 @@ int main() {
         run(plugins_carry_and_take_a_step_in_the_camera_cycle);
         run(screen_shader_files_are_checked);
         run(plugins_run_a_screen_shader);
+        run(plugins_run_a_world_shader);
         run(plugins_read_joints_and_tune_physics);
         run(plugins_type_and_use_the_room);
         run(plugins_read_menu_pose);

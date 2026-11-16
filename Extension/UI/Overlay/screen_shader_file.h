@@ -25,6 +25,8 @@ inline constexpr std::size_t value_count = value_vectors * 4;   // its numbers, 
 inline constexpr std::size_t most_source_bytes = 256u * 1024u;  // an .hlsl file
 inline constexpr std::size_t most_compiled_bytes = 1024u * 1024u; // a compiled container
 inline constexpr std::size_t most_parts = 64;
+// A world shader's data (reskate.world.shader_data; world_shader.h): whole float4s, at most this many bytes.
+inline constexpr std::size_t world_data_most_bytes = 64u * 1024u;
 
 // In front of a plugin's HLSL source. A compiled shader declares the same itself (the bindings are what count;
 // the names are the plugin's own).
