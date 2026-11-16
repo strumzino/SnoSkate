@@ -305,6 +305,8 @@ struct Shared {
     std::uint64_t finished_frame{~std::uint64_t{0}};
     std::uint64_t written_frame{~std::uint64_t{0}}; // the frame the locked kind's picture was last drawn into
     unsigned unlocked_waited{};
+    std::uint64_t active_frames{}; // frames since the shader last came on (it rests out of play, in menus, and off)
+    std::vector<std::uint64_t> skipped_at; // the stretch's frames without it, as active_frames counted them (the first 12)
     unsigned depth_copies{}; // copies of the depth taken this frame (more than one: it became readable more than once) // frames the shader waited for the world's picture to be chosen (at most 120, once)
     ID3D12Resource* finished_picture{};
     D3D12_RESOURCE_STATES finished_state{};
@@ -1633,6 +1635,7 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         const bool ready = original_execute.load() && !s.failed && s.queue && !retired.load();
         active.store(ready && wanted.load() && allowed.load());
         if (!active.load()) {
+            s.active_frames = 0;
             s.notes.clear();
             // The world's depth is found again when the shader is back: a level loaded meanwhile has a
             // new one, and the old one is the game's to free.
@@ -1671,6 +1674,7 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         if (s.main_depth) {
             ++s.outcomes[s.drawn ? "drawn" : !s.tried ? "the frame's last batch (to the screen) not seen" : (s.why ? s.why : "not drawn")];
             if (!s.drawn && !s.tried && s.finished_frame != s.frame) ++s.outcomes["no finished picture seen this frame"];
+            if (!s.drawn && !s.tried && s.skipped_at.size() < 12) s.skipped_at.push_back(s.active_frames);
             if (s.depth_copies > 1) ++s.outcomes["the depth copied more than once"];
             if (++s.outcome_frames >= 600) {
                 // Said whenever a frame of them went without the shader (a blink of it, 2026-11-16), else the first
@@ -1685,9 +1689,15 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
                     if (!missed) ++s.outcome_reports;
                     std::string line = "World shader: the last 600 frames:";
                     for (const auto& [what, count] : s.outcomes) line += std::format(" {} {};", what, count);
+                    if (!s.skipped_at.empty()) {
+                        line += " skipped at frames";
+                        for (const auto at : s.skipped_at) line += std::format(" {}", at);
+                        line += " after it came on;";
+                    }
                     logging::write(missed ? logging::Level::info : logging::Level::debug, logging::Channel::graphics, line);
                 }
                 s.outcomes.clear();
+                s.skipped_at.clear();
                 s.outcome_frames = 0;
             }
         }
@@ -1723,6 +1733,7 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         }
         s.frame_last = 0;
         s.depth_copies = 0;
+        ++s.active_frames;
         s.locked_seen = false;
         s.pending = s.drawn = s.depth_elsewhere = s.unsafe = s.main_seen = false;
         s.colour_state_known = false;
