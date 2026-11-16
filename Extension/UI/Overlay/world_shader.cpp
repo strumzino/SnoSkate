@@ -187,10 +187,9 @@ struct Notes {
     unsigned finished_count{};
     bool drawn_inside{}; // the plugin's shader was drawn on this list itself (draw_inside)
     const char* inside_why{}; // why it was not, where it was looked at
-    // Full-size float pictures moved into being written on this list (the first four): the list that draws the scene's
-    // picture, not one that only takes it over finished.
-    std::array<ID3D12Resource*, 4> made_writable{};
-    unsigned made_writable_count{};
+    // How much the game had recorded on this list (the calls followed, ListState::calls) when it finished the picture of
+    // the kind locked onto, or -1 when that is not known.
+    long long calls_at_finish{-1};
 };
 struct Shared {
     std::mutex mutex;
@@ -333,6 +332,12 @@ struct Shared {
     ID3D12Resource* finished_first{};   // the first picture it finished (of any kind)
     unsigned finished_said{};           // such frames said in the log (the first 12)
     const char* finished_why{};         // whether the shader was drawn inside that list, or why not
+    long long finished_calls{-1};       // how much that list had recorded when it finished the picture
+    // How much the screen's list has recorded when it finishes the picture, on the frames it does (most): the most of the
+    // last 120, and how many were seen. A list that finishes it with far more recorded drew it itself.
+    std::deque<long long> screen_calls;
+    long long screen_calls_most{};
+    unsigned screen_calls_seen{};
 };
 Shared& shared() { static auto* value = new Shared; return *value; }
 
@@ -403,6 +408,12 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             const auto found = s.notes.find(static_cast<ID3D12GraphicsCommandList*>(lists[i]));
             if (found == s.notes.end() || !found->second.composite) continue;
             to_screen = true;
+            if (found->second.final_picture && found->second.calls_at_finish >= 0) {
+                s.screen_calls.push_back(found->second.calls_at_finish);
+                while (s.screen_calls.size() > 120) s.screen_calls.pop_front();
+                s.screen_calls_most = *std::max_element(s.screen_calls.begin(), s.screen_calls.end());
+                ++s.screen_calls_seen;
+            }
             if (found->second.final_picture) composite = &found->second;
         }
         // The screen's batch without the finished picture's barrier on it: on some frames the game moves the picture
@@ -439,10 +450,10 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
                     logging::printf(logging::Level::info, logging::Channel::graphics,
                                     "World shader: the picture finished in an earlier batch (frame %llu): %u of the kind locked onto finished on "
                                     "that list; drawn into the last of them (%p, state 0x%x), the first finished was %p, the last written %p; "
-                                    "not drawn inside that list: %s.",
+                                    "not drawn inside that list: %s (%lld calls recorded on it, the screen's list at most %lld).",
                                     static_cast<unsigned long long>(s.active_frames), s.finished_count, static_cast<void*>(s.finished_picture),
                                     static_cast<unsigned>(s.finished_state), static_cast<void*>(s.finished_first), static_cast<void*>(last_written),
-                                    s.finished_why ? s.finished_why : "not looked at");
+                                    s.finished_why ? s.finished_why : "not looked at", s.finished_calls, s.screen_calls_most);
                 }
             }
             if (locked_written) ++s.outcomes["the locked picture, none finished seen"];
@@ -484,6 +495,7 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
                 s.finished_count = n.finished_count;
                 s.finished_first = n.final_picture;
                 s.finished_why = n.drawn_inside ? "drawn inside it" : n.inside_why ? n.inside_why : "not looked at";
+                s.finished_calls = n.calls_at_finish;
             }
             // A picture counts only once the world's depth is done and readable: one written before
             // that is not the lit world (the game writes one then, and the shader could never read the
@@ -1353,6 +1365,7 @@ struct RootArg {
 };
 struct ListState {
     bool complete{};
+    unsigned calls{}; // the calls followed since its Reset: how much the game recorded on it
     std::uint64_t reset{}; // which Reset of the list this follows (list_resets)
     ID3D12PipelineState* pipeline{};
     UINT heap_count{};
@@ -1393,7 +1406,11 @@ bool latest_reset(ID3D12GraphicsCommandList* list, std::uint64_t reset) {
     const auto found = list_resets.find(list);
     return found != list_resets.end() && found->second == reset;
 }
-ListState& state_of(ID3D12GraphicsCommandList* list) { return list_states[list]; }
+ListState& state_of(ID3D12GraphicsCommandList* list) {
+    auto& st = list_states[list];
+    ++st.calls; // every hook that follows the list comes through here
+    return st;
+}
 bool following() { return tracking.load(std::memory_order_relaxed) && !drawing_inside; }
 RootArg& arg_of(ListState& st, bool compute, UINT index) {
     auto& args = st.args[compute ? 1 : 0];
@@ -2317,21 +2334,6 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
         }
         if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !b.Transition.pResource) return;
         auto* const resource = b.Transition.pResource;
-        // A full-size float picture moved into being written on this list (Notes::made_writable).
-        constexpr auto writable = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        if (tracking.load(std::memory_order_relaxed) && (b.Transition.StateAfter & writable) && !(b.Transition.StateBefore & writable) &&
-            list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-            const auto d = resource->GetDesc();
-            if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && hdr_view_format(d.Format) != DXGI_FORMAT_UNKNOWN) {
-                auto& s = shared();
-                std::lock_guard lock(s.mutex);
-                auto& n = s.notes[list];
-                if (d.Width == s.depth_width && d.Height == s.depth_height && n.made_writable_count < n.made_writable.size() &&
-                    std::find(n.made_writable.begin(), n.made_writable.begin() + n.made_writable_count, resource) ==
-                        n.made_writable.begin() + n.made_writable_count)
-                    n.made_writable[n.made_writable_count++] = resource;
-            }
-        }
         // The frame's last list (Notes::composite): the screen made a render target, and the finished
         // scene's float picture moved from being written to being read on the same list.
         if (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT && b.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE) {
@@ -2363,10 +2365,18 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
                                                 !(depth_state & D3D12_RESOURCE_STATE_DEPTH_WRITE);
                         // Only on a list that drew the picture itself: on most frames the picture is finished at the start of the
                         // screen's list, drawn in an earlier one, and the moment between batches before it is the right one.
-                        const auto written_here = std::find(n.made_writable.begin(), n.made_writable.begin() + n.made_writable_count, resource) !=
-                                                  n.made_writable.begin() + n.made_writable_count;
+                        // How much the game had recorded on this list by now, against what it has when it finishes the picture at
+                        // the start of the screen's list (most frames, learnt from them): far more is the list that drew it.
+                        const auto known_list = list_states.find(list);
+                        const long long calls = known_list != list_states.end() && known_list->second.complete
+                                                    ? static_cast<long long>(known_list->second.calls) : -1;
+                        if (kind == s.locked) n.calls_at_finish = calls;
+                        const bool learnt = s.screen_calls_seen >= 60;
+                        const bool written_here = learnt && calls > s.screen_calls_most * 2 + 16;
                         if (!n.composite && s.locked && kind == s.locked) {
-                            n.inside_why = !written_here ? "not drawn on that list"
+                            n.inside_why = calls < 0 ? "its state on that list not all known"
+                                         : !learnt ? "not learnt yet how much the screen's list records first"
+                                         : !written_here ? "too little recorded on that list before it"
                                          : s.drawn || s.inside_frame == s.frame ? "already drawn this frame"
                                          : !depth_done ? "the depth not done"
                                          : s.unsafe || n.unsafe || s.depth_elsewhere ? "a split or aliasing barrier, or another queue"
