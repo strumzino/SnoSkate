@@ -1,5 +1,6 @@
 #include "world_shader.h"
 #include "screen_shader_vs_dxil.h"
+#include "plugin_shader_compile.h"
 #include "Engine/Core/Hooks/hooks.h"
 #include "Engine/Core/Hooks/patches.h"
 #include "Engine/Core/Log/logging.h"
@@ -1269,35 +1270,19 @@ static void ensure_hooks() noexcept {
     } catch (...) {}
 }
 
-// HLSL compiled on a thread of its own; the program is ready or refused when it is done.
+// HLSL compiled on a thread of its own (plugin_shader_compile.h: DXIL with the game's own compiler where it loads, else
+// DXBC); the program is ready or refused when it is done.
 static void compile(std::shared_ptr<Program> program, std::string name, std::shared_ptr<const std::string> bytes) {
     std::thread([program = std::move(program), name = std::move(name), bytes = std::move(bytes)] {
-        std::string why, code;
-        try {
-            const std::string source = std::string(prelude) + *bytes;
-            ComPtr<ID3DBlob> blob, error;
-            if (FAILED(D3DCompile(source.data(), source.size(), name.c_str(), nullptr, nullptr, "main", "ps_5_0",
-                                  D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &error)) || !blob) {
-                why = "it did not compile";
-                if (error) {
-                    std::string text(static_cast<const char*>(error->GetBufferPointer()), error->GetBufferSize());
-                    while (!text.empty() && (text.back() == '\0' || text.back() == '\n' || text.back() == '\r')) text.pop_back();
-                    if (text.size() > 600) text = text.substr(0, 600) + "...";
-                    why += ": " + text;
-                }
-            } else {
-                code.assign(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());
-            }
-        } catch (...) {
-            why = "it did not compile (an exception was raised)";
-        }
+        auto made = plugin_shader_compile::compile_pixel_shader(std::string(prelude) + *bytes, name);
         auto& a = asked();
         std::lock_guard lock(a.mutex);
-        if (why.empty()) {
-            program->code = std::move(code);
+        if (!made.code.empty()) {
+            program->code = std::move(made.code);
+            program->dxil = made.dxil;
             program->state = Program::State::ready;
         } else {
-            refuse(*program, name, std::move(why));
+            refuse(*program, name, "it did not compile: " + made.error);
         }
     }).detach();
 }
