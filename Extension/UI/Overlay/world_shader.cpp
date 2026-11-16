@@ -33,7 +33,7 @@ using Microsoft::WRL::ComPtr;
 // Slots of the D3D12 interfaces' tables (d3d12.h's declaration order).
 constexpr std::size_t queue_execute = 10;
 // The cbuffer (prelude): 22 float4s, in a part of its own of the upload buffer.
-constexpr std::size_t cbuffer_floats = 22 * 4;
+constexpr std::size_t cbuffer_floats = 23 * 4; // (the prelude's cbuffer: reskate_light last)
 constexpr UINT64 cbuffer_bytes = 512;
 // Our copy of the game's depth, taken as soon as the game has finished it each frame (snapshot_depth):
 // read at the shader's moment the game's own had sometimes been used for something else by then, and
@@ -81,7 +81,11 @@ constexpr UINT64 data_offset = cbuffer_bytes;
 constexpr UINT64 heights_offset = data_offset + most_data_bytes;
 constexpr UINT64 upload_slice = (heights_offset + height_floats4 * 16 + 255) / 256 * 256;
 // The measurements: a column a point (ps_measure), read back by the CPU.
-constexpr UINT measure_columns = 32;
+constexpr UINT measure_columns = 32; // the near distance's (ps_measure)
+// And the picture's brightness, at a grid of 8 by 4 points (ps_measure, after the near distance's): averaged and eased on
+// the CPU into reskate_light.
+constexpr UINT light_columns = 32;
+constexpr UINT measure_width = measure_columns + light_columns;
 constexpr UINT measure_pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
 constexpr UINT64 measure_slice = UINT64{measure_pitch};
 // Command allocators: the depth's copy and the shader each take one a frame, and the GPU runs frames
@@ -90,6 +94,8 @@ constexpr std::size_t allocator_count = 16;
 // The draws inside the game's own lists (draw_inside): each its own part of the upload buffer and its own views, after
 // the allocators'. Four: the GPU is done with one by the time it comes round again.
 constexpr std::size_t inside_ring = 4;
+// The measurements' slots in the readback buffer: one each allocator's list, then one each draw inside a game's list.
+constexpr std::size_t measure_slots = allocator_count + inside_ring;
 // A smaller screen-shaped depth takes the world's place only once the one known has been missed this many presents
 // (a render scale below 100%, a smaller screen). At 30, the game's half-size depth (960x540 at 1080p) took over for a
 // moment as the time of day's shadow and sky caches came back on (the full one is made anew then), and the near
@@ -186,6 +192,7 @@ struct Notes {
     DXGI_FORMAT last_format{};
     unsigned finished_count{};
     bool drawn_inside{}; // the plugin's shader was drawn on this list itself (draw_inside)
+    std::size_t inside_slot{}; // and in which of the draws inside (inside_ring)
     const char* inside_why{}; // why it was not, where it was looked at
     // How much the game had recorded on this list (the calls followed, ListState::calls) when it finished the picture of
     // the kind locked onto, or -1 when that is not known.
@@ -250,10 +257,18 @@ struct Shared {
     ComPtr<ID3D12Resource> measure, measure_readback;
     ComPtr<ID3D12PipelineState> measure_pipeline;
     const std::uint8_t* measure_cpu{};
-    std::array<bool, allocator_count> measure_waiting{};
+    std::array<bool, measure_slots> measure_waiting{};
+    std::array<bool, measure_slots> measure_anchored{}; // whether the near distance was measured in it (an anchor set)
     // Whether that frame was drawn with its own depth: one drawn with an older copy (the camera moved
     // since) measured the near distance too short, and it was held (0.056 m for 0.060, 2026-11-12).
-    std::array<bool, allocator_count> measure_fresh{};
+    std::array<bool, measure_slots> measure_fresh{};
+    // A draw inside a game's list: the fence value once its list has run (set when the list is submitted, ~0 before).
+    std::array<UINT64, inside_ring> inside_fence{};
+    std::size_t inside_last_slot{};
+    // The picture's brightness (reskate_light): the last measured, and eased over about half a second, and when.
+    float light_raw{}, light{};
+    bool light_known{};
+    std::uint64_t light_at_us{};
     // The shader's time on the GPU: a timestamp before and after each allocator's list, read back when it is free,
     // against the budget (world_budget_ms), for the shader it was drawn with.
     ComPtr<ID3D12QueryHeap> timer_heap;
@@ -477,10 +492,13 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             }
         }
         bool depth_finished = false;
+        std::array<bool, inside_ring> inside_submitted{}; // the draws inside this batch's lists (their fence, below)
+        bool any_inside = false;
         for (UINT i = 0; i < count; ++i) {
             const auto found = s.notes.find(static_cast<ID3D12GraphicsCommandList*>(lists[i]));
             if (found == s.notes.end()) continue;
             const auto& n = found->second;
+            if (n.drawn_inside) inside_submitted[n.inside_slot] = any_inside = true;
             if (n.depth_state_known) {
                 s.depth_state_known = true;
                 s.depth_state = n.depth_state;
@@ -519,6 +537,15 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
         }
         lock.unlock();
         original(queue, count, lists);
+        if (any_inside) {
+            // When the GPU is past this batch, the measurements drawn inside its lists can be read.
+            std::lock_guard again(s.mutex);
+            if (s.fence) {
+                queue->Signal(s.fence.Get(), ++s.fence_value);
+                for (std::size_t k = 0; k < inside_ring; ++k)
+                    if (inside_submitted[k]) s.inside_fence[k] = s.fence_value;
+            }
+        }
         if (depth_finished) {
             std::lock_guard again(s.mutex);
             (void)snapshot_depth(s, queue, original);
@@ -546,7 +573,7 @@ constexpr const char* builtin_source = R"hlsl(
 cbuffer ReSkateWorld : register(b0) {
     float4 right_focal; float4 up_width; float4 back_height; float4 eye_near;
     float4 last_right; float4 last_up; float4 last_back; float4 last_eye;
-    float4 anchor; float4 clock; float4 values[12];
+    float4 anchor; float4 clock; float4 values[12]; float4 light;
 };
 Texture2D<float4> picture : register(t0);
 Texture2D<float> depth : register(t1);
@@ -582,6 +609,12 @@ float measure_at(float3 target) {
 // the biggest group that agrees.
 float ps_measure(Interpolated input) : SV_Target {
     const uint k = (uint)input.position.x;
+    // Past the near distance's: the picture's brightness, at a grid of 8 by 4 points.
+    if (k >= 32u) {
+        const uint g = k - 32u;
+        const int2 at = int2((float(g % 8u) + 0.5) / 8.0 * up_width.w, (float(g / 8u) + 0.5) / 4.0 * back_height.w);
+        return dot(picture.Load(int3(at, 0)).rgb, float3(0.2126, 0.7152, 0.0722));
+    }
     if (anchor.w < 0.5) return 0;
     // Not with the camera looking steeply down (or up) the column: its points then lie over each other on screen, on the
     // skater's head and shoulders, nearer than themselves, and enough of them agreed on a near distance too short to be
@@ -795,7 +828,7 @@ bool build_list(Shared& s) {
         gpu.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC measured{};
         measured.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        measured.Width = measure_columns;
+        measured.Width = measure_width;
         measured.Height = 1;
         measured.DepthOrArraySize = 1;
         measured.MipLevels = 1;
@@ -804,7 +837,7 @@ bool build_list(Shared& s) {
         measured.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         D3D12_HEAP_PROPERTIES readback{};
         readback.Type = D3D12_HEAP_TYPE_READBACK;
-        bytes.Width = measure_slice * s.allocators.size();
+        bytes.Width = measure_slice * measure_slots;
         void* read{};
         if (FAILED(s.device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &measured, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
                                                      IID_PPV_ARGS(&s.measure))) ||
@@ -1043,6 +1076,63 @@ void take_measurements(Shared& s, const std::uint8_t* rows) {
                         best_count, measure_columns);
 }
 
+// The picture's brightness from one frame's measurements (ps_measure's grid), eased over about half a second
+// (reskate_light), in steps of brightness (as the eye takes them), so a plugin's shader can light with it steadily: from
+// one frame's own points, a dark or bright thing passing over them as the camera turned made the light jump (the snow's
+// fog and flakes flickered, 2026-11-16).
+void take_light(Shared& s, const std::uint8_t* rows) {
+    const auto* row = reinterpret_cast<const float*>(rows) + measure_columns;
+    double sum = 0;
+    unsigned n = 0;
+    for (UINT i = 0; i < light_columns; ++i)
+        if (std::isfinite(row[i]) && row[i] >= 0 && row[i] < 1e6f) sum += row[i], ++n;
+    if (!n) return;
+    const float raw = std::max(static_cast<float>(sum / n), 1e-5f);
+    const std::uint64_t now = now_us();
+    if (!s.light_known) {
+        s.light = raw;
+        s.light_known = true;
+    } else {
+        const float seconds = std::clamp(static_cast<float>(now - s.light_at_us) / 1e6f, 0.0f, 1.0f);
+        const float k = std::min(seconds / 0.5f, 1.0f);
+        s.light = std::exp(std::log(std::max(s.light, 1e-5f)) + (std::log(raw) - std::log(std::max(s.light, 1e-5f))) * k);
+    }
+    s.light_raw = raw;
+    s.light_at_us = now;
+}
+
+// The measurements (ps_measure: the near distance's, then the picture's brightness) drawn into `measure` with the
+// constants and views already set for the plugin's shader, and copied to the readback buffer's `slot`. `move` takes a
+// resource from one state to another on `list` (our own list's barrier, or straight to a game list's).
+template <typename Move>
+void record_measure(Shared& s, ID3D12GraphicsCommandList* list, std::size_t slot, Move&& move) {
+    auto measure_target = s.targets->GetCPUDescriptorHandleForHeapStart();
+    measure_target.ptr += SIZE_T{s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)} * 4;
+    D3D12_RENDER_TARGET_VIEW_DESC measure_view{};
+    measure_view.Format = DXGI_FORMAT_R32_FLOAT;
+    measure_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    s.device->CreateRenderTargetView(s.measure.Get(), &measure_view, measure_target);
+    move(s.measure.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    list->SetPipelineState(s.measure_pipeline.Get());
+    const D3D12_VIEWPORT measure_viewport{0, 0, static_cast<float>(measure_width), 1, 0, 1};
+    const D3D12_RECT small_scissor{0, 0, static_cast<LONG>(measure_width), 1};
+    list->RSSetViewports(1, &measure_viewport);
+    list->RSSetScissorRects(1, &small_scissor);
+    list->OMSetRenderTargets(1, &measure_target, FALSE, nullptr);
+    list->DrawInstanced(3, 1, 0, 0);
+    move(s.measure.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION to{};
+    to.pResource = s.measure_readback.Get();
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint.Offset = slot * measure_slice;
+    to.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, measure_width, 1, 1, measure_pitch};
+    D3D12_TEXTURE_COPY_LOCATION from{};
+    from.pResource = s.measure.Get();
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    from.SubresourceIndex = 0;
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+}
+
 // Records our list: the picture copied, then drawn back through the plugin's shader. Under the lock.
 // The camera the picture was drawn with (camera_delay), this frame's taken into the history first: between the two kept
 // either side of it, blended (its axes made unit again); the oldest kept, until there are enough.
@@ -1125,6 +1215,10 @@ void fill_slice(Shared& s, Asked& a, std::uint8_t* slice, std::uint64_t& data_up
         anchored ? (*a.anchor)[0] : 0.0f, anchored ? (*a.anchor)[1] : 0.0f, anchored ? (*a.anchor)[2] : 0.0f, anchored ? 1.0f : 0.0f,
         static_cast<float>(clock_seconds()), frame_seconds, static_cast<float>(data_floats4), a.heights ? 1.0f : 0.0f};
     for (std::size_t i = 0; i < value_count; ++i) constants[40 + i] = a.values[i];
+    // reskate_light: the picture's brightness eased, the last measured, 1 once measured.
+    constants[88] = s.light_known ? s.light : 0.0f;
+    constants[89] = s.light_known ? s.light_raw : 0.0f;
+    constants[90] = s.light_known ? 1.0f : 0.0f;
     std::memcpy(slice, constants.data(), sizeof(constants));
     s.last_camera = camera;
 }
@@ -1199,7 +1293,11 @@ bool record_shader(Shared& s) {
     auto& a = asked();
     std::lock_guard asked_lock(a.mutex);
     // What this allocator's last list measured: the GPU is done with it.
-    if (s.measure_waiting[at] && s.measure_fresh[at] && s.measure_cpu) take_measurements(s, s.measure_cpu + at * measure_slice);
+    if (s.measure_waiting[at] && s.measure_cpu) {
+        const std::uint8_t* const rows = s.measure_cpu + at * measure_slice;
+        take_light(s, rows);
+        if (s.measure_anchored[at] && s.measure_fresh[at]) take_measurements(s, rows);
+    }
     s.measure_waiting[at] = false;
     // And how long its shader took on the GPU, against the budget.
     if (s.timer_waiting[at] && s.timer_cpu && s.timer_frequency) {
@@ -1283,7 +1381,6 @@ bool record_shader(Shared& s) {
     D3D12_RENDER_TARGET_VIEW_DESC target_view{};
     target_view.Format = s.colour_format;
     target_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-    const UINT target_step = s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto target = s.targets->GetCPUDescriptorHandleForHeapStart();
     s.device->CreateRenderTargetView(s.colour, &target_view, target);
 
@@ -1316,34 +1413,9 @@ bool record_shader(Shared& s) {
     list->DrawInstanced(3, 1, 0, 0);
     list->EndQuery(s.timer_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(at * 2 + 1));
 
-    // The measurements, with the same constants and views, copied out for the CPU (take_measurements).
-    if (anchored) {
-        auto measure_target = s.targets->GetCPUDescriptorHandleForHeapStart();
-        measure_target.ptr += SIZE_T{target_step} * 4;
-        D3D12_RENDER_TARGET_VIEW_DESC measure_view{};
-        measure_view.Format = DXGI_FORMAT_R32_FLOAT;
-        measure_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        s.device->CreateRenderTargetView(s.measure.Get(), &measure_view, measure_target);
-        transition(list, s.measure.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        list->SetPipelineState(s.measure_pipeline.Get());
-        const D3D12_VIEWPORT measure_viewport{0, 0, static_cast<float>(measure_columns), 1, 0, 1};
-        const D3D12_RECT small_scissor{0, 0, static_cast<LONG>(measure_columns), 1};
-        list->RSSetViewports(1, &measure_viewport);
-        list->RSSetScissorRects(1, &small_scissor);
-        list->OMSetRenderTargets(1, &measure_target, FALSE, nullptr);
-        list->DrawInstanced(3, 1, 0, 0);
-        transition(list, s.measure.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        D3D12_TEXTURE_COPY_LOCATION to{};
-        to.pResource = s.measure_readback.Get();
-        to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        to.PlacedFootprint.Offset = at * measure_slice;
-        to.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, measure_columns, 1, 1, measure_pitch};
-        D3D12_TEXTURE_COPY_LOCATION from{};
-        from.pResource = s.measure.Get();
-        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        from.SubresourceIndex = 0;
-        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-    }
+    // The measurements, with the same constants and views, copied out for the CPU (take_light, take_measurements): every
+    // frame, for the picture's brightness; the near distance's only with an anchor set.
+    record_measure(s, list, at, [&](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to_state) { transition(list, r, from, to_state); });
 
     transition(list, s.colour, D3D12_RESOURCE_STATE_RENDER_TARGET, before);
     transition(list, s.picture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1352,7 +1424,8 @@ bool record_shader(Shared& s) {
     if (FAILED(list->Close())) return false;
     // Only once the list is closed (it goes to the GPU now): one that failed to close never runs, and its slot read
     // back next time would be an older frame's, taken as this one's.
-    s.measure_waiting[at] = anchored;
+    s.measure_waiting[at] = true;
+    s.measure_anchored[at] = anchored;
     s.measure_fresh[at] = s.depth_copied_frame == s.frame;
     s.timer_waiting[at] = true;
     s.timer_key[at] = a.key;
@@ -1663,6 +1736,21 @@ bool draw_inside(Shared& s, ID3D12GraphicsCommandList* list, ID3D12Resource* pic
     if (!pipeline) return false;
     const std::size_t slot = s.inside_next;
     s.inside_next = (slot + 1) % inside_ring;
+    // This slot's last measurements, once the game's list they were in has run (its fence); until then none taken here.
+    // (Drawn inside on every frame, the near distance was never measured again, and the light never at all.)
+    const std::size_t measured_at = s.allocators.size() + slot;
+    bool measure_here = s.measure && s.measure_pipeline && s.measure_cpu && s.fence;
+    if (s.measure_waiting[measured_at]) {
+        if (s.inside_fence[slot] != ~UINT64{0} && s.fence && s.fence->GetCompletedValue() >= s.inside_fence[slot]) {
+            const std::uint8_t* const rows = s.measure_cpu + measured_at * measure_slice;
+            take_light(s, rows);
+            if (s.measure_anchored[measured_at] && s.measure_fresh[measured_at]) take_measurements(s, rows);
+            s.measure_waiting[measured_at] = false;
+        } else {
+            measure_here = false;
+            if (s.inside_fence[slot] == ~UINT64{0}) s.measure_waiting[measured_at] = false; // its list was never submitted
+        }
+    }
     const auto camera = picture_camera(s, *projector);
     const bool have_last = s.last_drawn_frame + 1 == s.frame;
     const std::size_t part = s.allocators.size() + slot; // the upload buffer's parts after the allocators'
@@ -1727,6 +1815,14 @@ bool draw_inside(Shared& s, ID3D12GraphicsCommandList* list, ID3D12Resource* pic
     list->OMSetRenderTargets(1, &target, FALSE, nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     list->DrawInstanced(3, 1, 0, 0);
+    if (measure_here) {
+        record_measure(s, list, measured_at, move);
+        s.measure_waiting[measured_at] = true;
+        s.measure_anchored[measured_at] = a.anchor && GetTickCount64() < a.anchor_until;
+        s.measure_fresh[measured_at] = s.depth_copied_frame == s.frame;
+        s.inside_fence[slot] = ~UINT64{0}; // set when its list is submitted
+    }
+    s.inside_last_slot = slot;
     move(picture, D3D12_RESOURCE_STATE_RENDER_TARGET, before);
     move(s.picture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     restore(list, known->second);
@@ -2113,19 +2209,32 @@ void measure_heights(GroundTop ground_top) noexcept {
         ++a.heights_version;
     } catch (...) {}
 }
-void allow(bool playing) noexcept {
+void allow(bool playing, bool in_menu) noexcept {
     const std::uint64_t now = GetTickCount64();
     static std::uint64_t last_allowed{}; // when the shader was last allowed
     static std::uint64_t stopped_since{}; // when the level stopped being in play (0: it is)
+    static bool said_off{};
     if (!playing) {
         // Off only once it has been so for a quarter of a second: the game said so for a single frame
         // now and then, and the shader went off, and its depth was given up and found again, so the snow
-        // blinked out for a moment (2026-11-12). A menu opened is off a moment later.
+        // blinked out for a moment (2026-11-12). A menu opened is off a moment later. The game not ready without a
+        // menu (a time of day's lighting loading as the weather changed, with the world still drawn) only after 2.5 s:
+        // a quarter of a second took the shader off and on again while the world went on (2026-11-16).
         if (!stopped_since) stopped_since = now;
-        if (allowed.load() && now - stopped_since < 250) return;
+        if (allowed.load() && now - stopped_since < (in_menu ? 250u : 2500u)) return;
+        if (allowed.load() && !said_off) {
+            said_off = true;
+            logging::printf(logging::Level::info, logging::Channel::graphics, "World shader: resting (%s).",
+                            in_menu ? "a game menu is open" : "the game is not ready");
+        }
         playing_since = 0;
         allowed.store(false);
         return;
+    }
+    if (said_off && stopped_since) {
+        said_off = false;
+        logging::printf(logging::Level::info, logging::Channel::graphics, "World shader: back after %llu ms.",
+                        static_cast<unsigned long long>(now - stopped_since));
     }
     stopped_since = 0;
     // Back within a few seconds of being drawn (a teleport, a menu opened and closed): at once. The
@@ -2298,6 +2407,10 @@ void release() noexcept {
         s.measure_pipeline.Reset();
         s.measure_waiting = {};
         s.measure_fresh = {};
+        s.measure_anchored = {};
+        s.inside_fence = {};
+        s.light_known = false;
+        s.light = s.light_raw = 0;
         s.timer_heap.Reset();
         s.timer_readback.Reset();
         s.timer_cpu = nullptr;
@@ -2404,6 +2517,7 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
                             if (!n.inside_why) {
                                 if (draw_inside(s, list, resource, b.Transition.StateBefore, original)) {
                                     n.drawn_inside = true;
+                                    n.inside_slot = s.inside_last_slot;
                                     s.inside_frame = s.frame;
                                 } else {
                                     n.inside_why = "its state on that list not all known, or not ready";

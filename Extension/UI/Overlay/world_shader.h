@@ -30,7 +30,7 @@
 // `main`), or a compiled pixel shader container (.cso or .dxbc: DXBC; .dxil: DXIL, signed), as screen_shader_file.h
 // checks. Its bindings, which ReSkate gives it and nothing else:
 //   b0  the cbuffer in `prelude` (the camera the picture was drawn with, last frame's, the measured near distance,
-//       an anchor, a clock, and the plugin's 48 values);
+//       an anchor, a clock, the plugin's 48 values, and the picture's brightness eased);
 //   t0  a copy of the world's picture before the shader (float, linear, not tone-mapped);
 //   t1  the world's depth, copied (R32_FLOAT, reversed: 1 at the near plane, 0 far away, 0 the sky; a pixel's
 //       distance along the view is near / depth);
@@ -64,6 +64,8 @@ cbuffer ReSkateWorld : register(b0) {
     float4 reskate_clock;        // seconds (from 0 again every 1000), seconds since the last frame, the plugin's
                                  // data's float4s (t2), 1 while the ground heights (t3) are measured
     float4 reskate_values[12];   // the plugin's (reskate.world.shader's values, four to a float4)
+    float4 reskate_light;        // the picture's brightness (its luminance, averaged over 32 points), eased over about half
+                                 // a second; this frame's own; 1 once measured, 0
 };
 Texture2D<float4> reskate_picture : register(t0);
 Texture2D<float> reskate_depth : register(t1);
@@ -117,8 +119,10 @@ using GroundTop = std::optional<float> (*)(float x, float z, float top, float bo
 // Client thread, every tick: while a world shader asks for the ground heights, some cells round the camera are measured.
 void measure_heights(GroundTop ground_top) noexcept;
 // Client thread, every tick: whether the world is being played now (a level in play, no game menu open). The shader
-// is drawn only once that has held for two seconds, never on the front page, in menus or while a level loads.
-void allow(bool playing) noexcept;
+// is drawn only once that has held for two seconds, never on the front page, in menus or while a level loads. `in_menu`:
+// a game menu is why not (the shader goes a quarter of a second later); otherwise (the game not ready a moment) it goes
+// only after 2.5 s.
+void allow(bool playing, bool in_menu = false) noexcept;
 
 // Render thread (the overlay), with its graphics: the device, the game's queue and the queues' table (through the
 // overlay's own). Nothing is hooked until a plugin first asks for a world shader.
