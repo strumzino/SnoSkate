@@ -265,8 +265,9 @@ struct Shared {
     // The picture's brightness (reskate_light): the last measured, and eased over about half a second, and when.
     float light_raw{}, light{};
     bool light_known{};
-    float far_light{}; // the open sky's, taken the first time, then eased over about 30 s, kept while none is in view
+    float far_light{}; // the open sky's: followed within a second for 15 s, then eased over about 30 s; kept while none is in view
     bool far_known{};
+    std::uint64_t far_since_us{}; // when it was first taken
     std::uint64_t light_at_us{};
     // The shader's time on the GPU: a timestamp before and after each allocator's list, read back when it is free,
     // against the budget (world_budget_ms), for the shader it was drawn with.
@@ -1129,9 +1130,14 @@ void take_light(Shared& s, const std::uint8_t* rows) {
         if (!s.far_known) {
             s.far_light = far_raw;
             s.far_known = true;
+            s.far_since_us = now;
         } else {
+            // For its first 15 s it follows within about a second (the light settling: the snow's weather had only just
+            // come on, the sky still dark, and taken then the fog spent minutes getting lighter, 2026-11-16); then over
+            // about 30 s.
             const float seconds = std::clamp(static_cast<float>(now - s.light_at_us) / 1e6f, 0.0f, 1.0f);
-            s.far_light = std::exp(std::log(s.far_light) + (std::log(far_raw) - std::log(s.far_light)) * std::min(seconds / 30.0f, 1.0f));
+            const float over = now - s.far_since_us < 15000000 ? 1.0f : 30.0f;
+            s.far_light = std::exp(std::log(s.far_light) + (std::log(far_raw) - std::log(s.far_light)) * std::min(seconds / over, 1.0f));
         }
     }
     if (!s.light_known) {
@@ -2329,6 +2335,7 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
                 s.candidate = nullptr;
                 s.candidate_run = 0;
                 s.finals = {}; // (pictures known from before are not trusted after a rest)
+                s.far_known = false; // (and the sky's light settles afresh when it is back)
                 main_depth_now.store(nullptr);
                 s.depth_state_known = false;
                 s.depth_width = s.depth_height = 0;
