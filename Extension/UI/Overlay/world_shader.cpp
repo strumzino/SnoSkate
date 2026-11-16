@@ -1675,9 +1675,12 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
             if (++s.outcome_frames >= 600) {
                 // Said whenever a frame of them went without the shader (a blink of it, 2026-11-16), else the first
                 // eight times at debug.
-                // Any frame not plainly drawn: one without it, one drawn with an older copy of the depth, or into a
-                // picture found another way (the snow vanished for an instant on frames counted as drawn, 2026-11-16).
-                const bool missed = s.outcomes.size() > 1 || !s.outcomes.contains("drawn");
+                // Any frame without it, or drawn into a picture found another way (the snow vanished for an instant on
+                // frames counted as drawn, 2026-11-16). Not for the depth copied twice (the game makes it readable twice
+                // nearly every frame) or the last frame's copy (a frame or two a stretch): normal, said with the rest.
+                bool missed = !s.outcomes.contains("drawn");
+                for (const auto& [what, count] : s.outcomes)
+                    if (what != "drawn" && what != "the depth copied more than once" && what != "drawn with the last frame's depth") missed = true;
                 if (missed || s.outcome_reports < 8) {
                     if (!missed) ++s.outcome_reports;
                     std::string line = "World shader: the last 600 frames:";
