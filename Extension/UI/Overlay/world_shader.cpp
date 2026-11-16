@@ -300,6 +300,7 @@ struct Shared {
     float shown_near{}; // what the shader is given: held_near, eased into over half a second
     std::uint64_t shown_near_at{};
     unsigned near_disagreed{}; // frames in a row far from held_near
+    unsigned near_changes_said{}; // changes of it said in the log at info (the first 20)
     float last_focal{};        // the camera's focal length last frame, and the frame it last changed (a new camera)
     std::uint64_t focal_changed_frame{};
     std::uint64_t measured_frames{};
@@ -1094,9 +1095,11 @@ void take_measurements(Shared& s, const std::uint8_t* rows) {
     // went up and down with the measurements made the snow's pattern jump on the ground, plainest
     // while the snow was half melted (2026-11-12).
     if (sorted.size() >= (s.relearning ? 30u : 5u) && (s.held_near <= 0 || s.relearning || *half < s.held_near * 0.997f)) {
+        const bool learnt_again = s.relearning;
         s.relearning = false;
         if (s.held_near > 0)
-            logging::printf(logging::Level::debug, logging::Channel::graphics, "World shader: near distance %.5f, was %.5f.", *half, s.held_near);
+            logging::printf(++s.near_changes_said <= 20 ? logging::Level::info : logging::Level::debug, logging::Channel::graphics,
+                            "World shader: near distance %.5f, was %.5f%s.", *half, s.held_near, learnt_again ? " (learnt again)" : "");
         s.held_near = *half;
     }
     if (++s.measured_frames % 1800 == 300)
@@ -1480,7 +1483,14 @@ bool record_shader(Shared& s) {
     // back next time would be an older frame's, taken as this one's.
     s.measure_waiting[at] = true;
     s.measure_anchored[at] = anchored;
-    s.measure_fresh[at] = s.depth_copied_frame == s.frame;
+    // Taken only with this frame's depth and the camera about still (under about half a degree a frame): turning, the
+    // camera the picture was drawn with is not quite the one worked out, the points measured missed the skater, and a
+    // wrong near distance shifted everything's distance, the rain's haze in the distance with it, as the camera tipped
+    // up from looking down (2026-11-16).
+    const auto& now_camera = s.cameras[0];
+    const auto& before_camera = s.cameras[std::min<std::size_t>(1, s.cameras_known ? s.cameras_known - 1 : 0)];
+    const float facing_same = now_camera[6] * before_camera[6] + now_camera[7] * before_camera[7] + now_camera[8] * before_camera[8];
+    s.measure_fresh[at] = s.depth_copied_frame == s.frame && facing_same > 0.99996f; // cos(0.5 degrees)
     s.timer_waiting[at] = true;
     s.timer_key[at] = a.key;
     s.last_drawn_frame = s.frame;
