@@ -341,6 +341,11 @@ struct Shared {
     unsigned unlocked_waited{};
     std::uint64_t active_frames{}; // frames since the shader last came on (it rests out of play, in menus, and off)
     std::vector<std::uint64_t> skipped_at; // the stretch's frames without it, as active_frames counted them (the first 12)
+    // One frame's barriers on the full-size float pictures, the screen's, our draws and the batches, in order, said in the
+    // log twice a run (at 900 and 3000 frames after it came on): where the game draws into the picture after the shader
+    // (water drawn over it, 2026-11-16).
+    std::string trace;
+    std::unordered_map<const void*, int> trace_ids;
     unsigned depth_copies{}; // copies of the depth taken this frame (more than one: it became readable more than once) // frames the shader waited for the world's picture to be chosen (at most 120, once)
     ID3D12Resource* finished_picture{};
     D3D12_RESOURCE_STATES finished_state{};
@@ -357,10 +362,17 @@ struct Shared {
     unsigned screen_calls_seen{};
 };
 Shared& shared() { static auto* value = new Shared; return *value; }
+// A short name for a list or a picture in the trace: L1, L2, ... and P1, P2, ... in the order seen. Under the lock.
+std::string trace_name(Shared& s, const void* what, char kind) {
+    const auto found = s.trace_ids.find(what);
+    const int id = found != s.trace_ids.end() ? found->second : (s.trace_ids[what] = static_cast<int>(s.trace_ids.size()) + 1);
+    return std::format("{}{}", kind, id);
+}
 
 std::atomic<ID3D12Resource*> main_depth_now{};
 std::atomic<ID3D12Resource*> colour_now{};
 std::atomic<bool> active{}; // wanted, and installed
+std::atomic<bool> tracing{}; // this frame's barriers are written into Shared::trace
 // The table of the runtime's command queues (the overlay's own queue's), where ensure_hooks puts its hook.
 std::atomic<void**> queue_table{};
 // And of its graphics command lists (the overlay's own list's), where the hooks that follow the game's lists go.
@@ -404,6 +416,11 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
         // almost a whole frame in one command list, so this is the first place after the scene is done
         // (traced 2026-11-10: the screen PRESENT to render target, the 1920x1080 R11G11B10 scene and the
         // RGBA8 UI layer read, the screen back to PRESENT, all in one batch of one list).
+        if (tracing.load(std::memory_order_relaxed)) {
+            s.trace += " BATCH[";
+            for (UINT i = 0; i < count; ++i) s.trace += (i ? " " : "") + trace_name(s, lists[i], 'L');
+            s.trace += "];";
+        }
         // A list of the batch the shader was drawn on itself (draw_inside): this frame has it.
         for (UINT i = 0; i < count && !s.drawn; ++i) {
             const auto found = s.notes.find(static_cast<ID3D12GraphicsCommandList*>(lists[i]));
@@ -477,6 +494,7 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             s.why = s.unsafe ? "a split or aliasing barrier, or another queue" : s.depth_elsewhere ? "the depth moved on another queue"
                   : final_format != s.chosen_format ? "the final picture in another format" : nullptr;
             const bool drew = !s.why && record_shader(s);
+            if (tracing.load(std::memory_order_relaxed)) s.trace += drew ? " OURS-BEFORE-THIS-BATCH;" : " (ours not drawn);";
             if (drew) {
                 s.drawn = true;
                 ID3D12CommandList* ours[] = {s.list.Get()};
@@ -1824,6 +1842,7 @@ bool draw_inside(Shared& s, ID3D12GraphicsCommandList* list, ID3D12Resource* pic
         s.inside_fence[slot] = ~UINT64{0}; // set when its list is submitted
     }
     s.inside_last_slot = slot;
+    if (tracing.load(std::memory_order_relaxed)) s.trace += " DRAWN-INSIDE-" + trace_name(s, list, 'L') + ";";
     move(picture, D3D12_RESOURCE_STATE_RENDER_TARGET, before);
     move(s.picture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     restore(list, known->second);
@@ -2367,7 +2386,16 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         }
         s.frame_last = 0;
         s.depth_copies = 0;
+        if (tracing.load()) {
+            tracing.store(false);
+            for (std::size_t at = 0; at < s.trace.size(); at += 900)
+                logging::printf(logging::Level::info, logging::Channel::graphics, "World shader: the frame's barriers (%zu of %zu): %s", at / 900 + 1,
+                                (s.trace.size() + 899) / 900, s.trace.substr(at, 900).c_str());
+            s.trace.clear();
+            s.trace_ids.clear();
+        }
         ++s.active_frames;
+        if (s.active_frames == 900 || s.active_frames == 3000) tracing.store(true);
         s.locked_seen = false;
         s.pending = s.drawn = s.depth_elsewhere = s.unsafe = s.main_seen = false;
         s.colour_state_known = false;
@@ -2467,6 +2495,27 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
         }
         if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !b.Transition.pResource) return;
         auto* const resource = b.Transition.pResource;
+        // The trace (one frame now and then): each full-size float picture's barrier and the screen's, by list, with how
+        // much the list had recorded, * on the kind locked onto.
+        if (tracing.load(std::memory_order_relaxed)) {
+            const auto d = resource->GetDesc();
+            auto& s = shared();
+            std::lock_guard lock(s.mutex);
+            const bool screen = b.Transition.StateBefore == D3D12_RESOURCE_STATE_PRESENT && (b.Transition.StateAfter & D3D12_RESOURCE_STATE_RENDER_TARGET) &&
+                                d.Width == s.width && d.Height == s.height;
+            const DXGI_FORMAT f = hdr_view_format(d.Format);
+            const bool picture = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && f != DXGI_FORMAT_UNKNOWN && d.Width == s.depth_width &&
+                                 d.Height == s.depth_height;
+            if ((screen || picture) && s.trace.size() < 9000) {
+                const auto known = list_states.find(list);
+                const long long calls = known != list_states.end() && known->second.complete ? static_cast<long long>(known->second.calls) : -1;
+                const std::uint64_t kind = std::uint64_t{static_cast<std::uint32_t>(f)} | (std::uint64_t{static_cast<std::uint32_t>(d.Flags)} << 8) |
+                                           ((b.Transition.StateBefore & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ? (std::uint64_t{1} << 40) : 0);
+                s.trace += std::format(" {}:{}@{} {:x}>{:x}{};", trace_name(s, list, 'L'), screen ? std::string("SCREEN") : trace_name(s, resource, 'P'), calls,
+                                       static_cast<unsigned>(b.Transition.StateBefore), static_cast<unsigned>(b.Transition.StateAfter),
+                                       picture && s.locked && kind == s.locked ? "*" : "");
+            }
+        }
         // The frame's last list (Notes::composite): the screen made a render target, and the finished
         // scene's float picture moved from being written to being read on the same list.
         if (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT && b.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE) {
