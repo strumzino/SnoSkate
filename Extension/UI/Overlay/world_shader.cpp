@@ -235,6 +235,8 @@ struct Shared {
     ComPtr<ID3D12PipelineState> depth_pipeline;
     std::uint64_t depth_copied_frame{~std::uint64_t{0}}; // the frame our depth copy was taken in
     std::array<float, 12> last_camera{};
+    std::optional<plugin_camera::Projector> last_projector; // the last camera read, and when (camera_now)
+    std::uint64_t last_projector_at{};
     std::uint64_t last_drawn_frame{~std::uint64_t{0}};
     ComPtr<ID3D12DescriptorHeap> views, targets;
     ComPtr<ID3D12RootSignature> root;
@@ -1127,6 +1129,23 @@ void fill_slice(Shared& s, Asked& a, std::uint8_t* slice, std::uint64_t& data_up
     s.last_camera = camera;
 }
 
+// The camera for the shader: the game's now, else, for up to 5 s, the last one read for a picture of this size. While
+// the game hitched (froze for a moment, then came back) no camera was read, and the shader went for 240 frames
+// (2026-11-16); the camera does not move while the game is frozen.
+std::optional<plugin_camera::Projector> camera_now(Shared& s, float width, float height) {
+    const std::uint64_t now = GetTickCount64();
+    if (auto projector = plugin_camera::projector(width, height)) {
+        s.last_projector = projector;
+        s.last_projector_at = now;
+        return projector;
+    }
+    if (s.last_projector && s.last_projector->width == width && s.last_projector->height == height && now - s.last_projector_at < 5000) {
+        ++s.outcomes["drawn with the last camera (none read)"];
+        return s.last_projector;
+    }
+    return std::nullopt;
+}
+
 bool record_shader(Shared& s) {
     s.why = "nothing to draw into";
     if (s.failed || !s.colour || !s.main_depth) return false;
@@ -1158,7 +1177,7 @@ bool record_shader(Shared& s) {
     constexpr auto usable = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE;
     if (s.colour_state == D3D12_RESOURCE_STATE_COMMON || (s.colour_state & ~usable) != 0) return false;
-    const auto projector = plugin_camera::projector(static_cast<float>(colour_desc.Width), static_cast<float>(colour_desc.Height));
+    const auto projector = camera_now(s, static_cast<float>(colour_desc.Width), static_cast<float>(colour_desc.Height));
     if (!projector) {
         s.why = "no camera";
         return false;
@@ -1634,7 +1653,7 @@ bool draw_inside(Shared& s, ID3D12GraphicsCommandList* list, ID3D12Resource* pic
         !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
         return false;
     const float width = static_cast<float>(desc.Width), height = static_cast<float>(desc.Height);
-    const auto projector = plugin_camera::projector(width, height);
+    const auto projector = camera_now(s, width, height);
     if (!projector) return false;
     auto& a = asked();
     std::lock_guard asked_lock(a.mutex);
