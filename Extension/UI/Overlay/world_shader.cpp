@@ -2506,6 +2506,12 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
             const DXGI_FORMAT f = hdr_view_format(d.Format);
             const bool picture = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && f != DXGI_FORMAT_UNKNOWN && d.Width == s.depth_width &&
                                  d.Height == s.depth_height;
+            const bool depth = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                               d.Width * 4 >= s.width && d.Height * 4 >= s.height;
+            if (depth && s.trace.size() < 9000)
+                s.trace += std::format(" {}:{}{}{}x{} {:x}>{:x};", trace_name(s, list, 'L'), trace_name(s, resource, 'D'),
+                                       resource == s.main_depth ? "(world)" : "", d.Width, d.Height,
+                                       static_cast<unsigned>(b.Transition.StateBefore), static_cast<unsigned>(b.Transition.StateAfter));
             if ((screen || picture) && s.trace.size() < 9000) {
                 const auto known = list_states.find(list);
                 const long long calls = known != list_states.end() && known->second.complete ? static_cast<long long>(known->second.calls) : -1;
@@ -2655,7 +2661,13 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
         if (resource == main_depth_now.load(std::memory_order_relaxed)) {
             auto& s = shared();
             std::lock_guard lock(s.mutex);
-            s.main_seen = true;
+            // Seen only as it is finished (from being written to being read): the game went on moving the one it had
+            // made before for something else after making the world's anew, so it was never missed, the new one never
+            // took over, and the shader went without a copy of the depth for the 300 presents a smaller one waits, then
+            // took the 960x540 one (the snow off for seconds at a time, 2026-11-16).
+            constexpr auto depth_read = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            if ((b.Transition.StateBefore & D3D12_RESOURCE_STATE_DEPTH_WRITE) && (b.Transition.StateAfter & depth_read)) s.main_seen = true;
             if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
                 s.depth_elsewhere = true; // another queue moves it: not this frame
                 return;
