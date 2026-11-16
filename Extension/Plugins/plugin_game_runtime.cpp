@@ -79,6 +79,8 @@
 #include "Extension/UI/Overlay/overlay.h"
 #include "Extension/UI/Overlay/screen_look.h"
 #include "Extension/UI/Overlay/world_cover.h"
+#include "Extension/UI/Overlay/screen_shader.h"
+#include "Extension/UI/Overlay/world_shader.h"
 #include "Extension/UI/Overlay/viewmodel.h"
 #include "Extension/UI/Overlay/scripted_pad.h"
 #include "Engine/Game/Input/pad_output.h"
@@ -1310,6 +1312,26 @@ public:
         world_cover::add_trail(point.at, point.width, point.fade, point.tread, point.starts, point.tread_lines);
         return {};
     }
+    std::string screen_shader(std::string_view plugin, std::optional<ScreenShader> shader) override {
+        if (!shader) {
+            screen_shader::clear(plugin);
+            return {};
+        }
+        return screen_shader::set(plugin, shader->file, shader->bytes, shader->kind, shader->values);
+    }
+    std::string world_shader(std::string_view plugin, std::optional<WorldShader> shader) override {
+        if (!shader) {
+            world_shader::clear(plugin);
+            return {};
+        }
+        return world_shader::set(plugin, shader->file, shader->bytes, shader->kind, shader->values, shader->heights);
+    }
+    std::string world_shader_data(std::string_view plugin, std::shared_ptr<const std::string> bytes) override {
+        return world_shader::set_data(plugin, std::move(bytes));
+    }
+    void world_shader_anchor(std::string_view plugin, std::optional<Vec3> at) override { world_shader::set_anchor(plugin, at); }
+    std::optional<double> world_shader_cost(std::string_view plugin) override { return world_shader::cost_ms(plugin); }
+    double world_shader_clock() override { return world_shader::clock_seconds(); }
     // ---- viewmodel -----------------------------------------------------------------------------------
     std::string viewmodel_load(std::string_view plugin, const std::filesystem::path& file) override {
         if (!viewmodeler_.empty() && viewmodeler_ != plugin) return viewmodeler_ + " has the viewmodel";
@@ -1974,6 +1996,7 @@ public:
         // the game counts it a menu (2026-11-12).
         const bool replay = base && multiplayer::replay_editor_open(base);
         world_cover::allow(base && ((ready && !multiplayer::sample_game_ui_state(base).in_menu) || replay));
+        world_shader::allow(base && ((ready && !multiplayer::sample_game_ui_state(base).in_menu) || replay));
         if (multiplayer::party_spectating()) {
             // Spectate has the lease now, and gives the game's camera back itself.
             camera_shown_ = camera_releasing_ = false;
@@ -2105,6 +2128,8 @@ public:
             world_cover::keep_clear({});
             coverer_.clear();
         }
+        screen_shader::clear(plugin);
+        world_shader::clear(plugin);
         if (viewmodeler_ == plugin) {
             viewmodel::unload();
             viewmodeler_.clear();

@@ -1,6 +1,7 @@
 #include "overlay_internal.h"
 #include "Engine/Core/Log/logging.h"
 #include "world_cover.h"
+#include "world_shader.h"
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -9,7 +10,7 @@
 // The game's depth for screen captures (reskate.capture). ID3D12GraphicsCommandList::ResourceBarrier
 // (slot 26) is hooked once, when the overlay starts (through its own command list: every list of
 // the runtime shares it). Unarmed, the hook only passes the call on. A plugin's world cover
-// (world_cover.h) sees the barriers through it too. In development builds the
+// (world_cover.h) and world shader (world_shader.h) see the barriers through it too. In development builds the
 // depth probe (depth_probe.cpp, `capture depth`) also looks at every barrier while it is armed.
 namespace dingosdk::overlay {
 namespace {
@@ -106,6 +107,10 @@ void STDMETHODCALLTYPE hooked_barrier(ID3D12GraphicsCommandList* list, UINT coun
     // A plugin's world cover (world_cover.h) copies the main depth and follows the world's colour.
     if (list && barriers && world_cover::on()) {
         for (UINT i = 0; i < count; ++i) world_cover::on_barrier(list, barriers[i], original);
+    }
+    // A plugin's world shader (world_shader.h) copies the main depth and follows the world's colour.
+    if (list && barriers && world_shader::on()) {
+        for (UINT i = 0; i < count; ++i) world_shader::on_barrier(list, barriers[i], original);
     }
 #if defined(DINGOSDK_DEV_TOOLS)
     detail::depth_probe_barrier(list, count, barriers, original);

@@ -375,6 +375,8 @@ bool take_mod_icon_pixels(CardPixels& pixels);
 inline constexpr UINT plugin_image_first_slot = 4, plugin_image_slots = 16;
 // Then the screen look's three (screen_look.h): its copy of the frame and the auto-iris's two targets.
 inline constexpr UINT screen_look_slot = plugin_image_first_slot + plugin_image_slots, screen_look_slots = 3;
+// Then a plugin's screen shader's one (screen_shader.h): its copy of the frame.
+inline constexpr UINT screen_shader_slot = screen_look_slot + screen_look_slots, screen_shader_slots = 1;
 ImTextureID plugin_image(const std::string& path, ImVec2& size);
 struct PluginImageUpload {
     std::string path;
@@ -387,7 +389,7 @@ void plugin_image_uploaded(const std::string& path, int slot, ImTextureID id, bo
 void plugin_images_lost();
 // Thunderstore packages' icons for the pause menu's Mod Manager page (store_icons.cpp), the same way,
 // by their URL, in the SRV heap's slots from store_icon_first_slot on.
-inline constexpr UINT store_icon_first_slot = screen_look_slot + screen_look_slots, store_icon_slots = 64;
+inline constexpr UINT store_icon_first_slot = screen_shader_slot + screen_shader_slots, store_icon_slots = 64;
 ImTextureID store_icon(const std::string& url);
 // The same, and whether it is still on its way (`loading`: asked for and neither there nor failed),
 // so a page can show it loading rather than as missing.
