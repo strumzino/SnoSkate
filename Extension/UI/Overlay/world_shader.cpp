@@ -1737,14 +1737,15 @@ bool draw_inside(Shared& s, ID3D12GraphicsCommandList* list, ID3D12Resource* pic
     const std::size_t slot = s.inside_next;
     s.inside_next = (slot + 1) % inside_ring;
     // This slot's last measurements, once the game's list they were in has run (its fence); until then none taken here.
-    // (Drawn inside on every frame, the near distance was never measured again, and the light never at all.)
+    // Only the picture's brightness: the near distance is not taken from a draw inside a game's list, whose depth copy can
+    // be the last frame's under this frame's camera (taken from it, the distance was learnt wrong and the snow round the
+    // skater went, 2026-11-16). Drawn inside on every frame, the light was never measured at all.
     const std::size_t measured_at = s.allocators.size() + slot;
     bool measure_here = s.measure && s.measure_pipeline && s.measure_cpu && s.fence;
     if (s.measure_waiting[measured_at]) {
         if (s.inside_fence[slot] != ~UINT64{0} && s.fence && s.fence->GetCompletedValue() >= s.inside_fence[slot]) {
             const std::uint8_t* const rows = s.measure_cpu + measured_at * measure_slice;
             take_light(s, rows);
-            if (s.measure_anchored[measured_at] && s.measure_fresh[measured_at]) take_measurements(s, rows);
             s.measure_waiting[measured_at] = false;
         } else {
             measure_here = false;
@@ -1818,8 +1819,8 @@ bool draw_inside(Shared& s, ID3D12GraphicsCommandList* list, ID3D12Resource* pic
     if (measure_here) {
         record_measure(s, list, measured_at, move);
         s.measure_waiting[measured_at] = true;
-        s.measure_anchored[measured_at] = a.anchor && GetTickCount64() < a.anchor_until;
-        s.measure_fresh[measured_at] = s.depth_copied_frame == s.frame;
+        s.measure_anchored[measured_at] = false; // (its near distance's points are not read)
+        s.measure_fresh[measured_at] = false;
         s.inside_fence[slot] = ~UINT64{0}; // set when its list is submitted
     }
     s.inside_last_slot = slot;
