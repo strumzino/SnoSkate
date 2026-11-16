@@ -176,6 +176,14 @@ struct Notes {
     ID3D12Resource* final_picture{};
     D3D12_RESOURCE_STATES final_before{}, final_after{};
     DXGI_FORMAT final_format{};
+    // On a list that is not the screen's (yet): the last full-size float picture of the kind locked onto moved from being
+    // written to being read, and how many were. The game keeps two of the kind and, on the frames it finishes the scene in an
+    // earlier batch, finishes both on that list: the first is not the one it shows, and the shader drawn into it blinked
+    // off for that frame (about one frame in 600, 2026-11-16).
+    ID3D12Resource* last_picture{};
+    D3D12_RESOURCE_STATES last_after{};
+    DXGI_FORMAT last_format{};
+    unsigned finished_count{};
 };
 struct Shared {
     std::mutex mutex;
@@ -311,6 +319,9 @@ struct Shared {
     ID3D12Resource* finished_picture{};
     D3D12_RESOURCE_STATES finished_state{};
     DXGI_FORMAT finished_format{};
+    unsigned finished_count{};          // how many of the locked kind that list finished
+    ID3D12Resource* finished_first{};   // the first picture it finished (of any kind)
+    unsigned finished_said{};           // such frames said in the log (the first 12)
 };
 Shared& shared() { static auto* value = new Shared; return *value; }
 
@@ -383,6 +394,7 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             s.why = "the world's picture not chosen yet";
         } else if ((composite || finished_before || locked_written) && !s.drawn) {
             s.tried = true;
+            ID3D12Resource* const last_written = s.colour; // the picture of the kind locked onto drawn into last (for the log)
             if (!locked_written) {
                 s.colour = composite ? composite->final_picture : s.finished_picture;
                 s.colour_state = composite ? composite->final_before : s.finished_state;
@@ -391,7 +403,17 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             const DXGI_FORMAT final_format = composite ? composite->final_format : finished_before ? s.finished_format : s.colour_format;
             if (s.chosen_format == DXGI_FORMAT_UNKNOWN) s.chosen_format = final_format;
             s.colour_format = s.chosen_format;
-            if (finished_before) ++s.outcomes["the picture finished in an earlier batch"];
+            if (finished_before) {
+                ++s.outcomes["the picture finished in an earlier batch"];
+                if (s.finished_said < 12) {
+                    ++s.finished_said;
+                    logging::printf(logging::Level::info, logging::Channel::graphics,
+                                    "World shader: the picture finished in an earlier batch (frame %llu): %u of the kind locked onto finished on "
+                                    "that list; drawn into the last of them (%p, state 0x%x), the first finished was %p, the last written %p.",
+                                    static_cast<unsigned long long>(s.active_frames), s.finished_count, static_cast<void*>(s.finished_picture),
+                                    static_cast<unsigned>(s.finished_state), static_cast<void*>(s.finished_first), static_cast<void*>(last_written));
+                }
+            }
             if (locked_written) ++s.outcomes["the locked picture, none finished seen"];
             s.why = s.unsafe ? "a split or aliasing barrier, or another queue" : s.depth_elsewhere ? "the depth moved on another queue"
                   : final_format != s.chosen_format ? "the final picture in another format" : nullptr;
@@ -422,11 +444,14 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
             }
             if (n.unsafe) s.unsafe = true;
             // A finished picture on a list that is not the screen's: kept for the screen's batch, if it comes later.
+            // The last of the kind locked onto it finished, else the first of any (before one is locked).
             if (n.final_picture && !n.composite) {
                 s.finished_frame = s.frame;
-                s.finished_picture = n.final_picture;
-                s.finished_state = n.final_after;
-                s.finished_format = n.final_format;
+                s.finished_picture = n.last_picture ? n.last_picture : n.final_picture;
+                s.finished_state = n.last_picture ? n.last_after : n.final_after;
+                s.finished_format = n.last_picture ? n.last_format : n.final_format;
+                s.finished_count = n.finished_count;
+                s.finished_first = n.final_picture;
             }
             // A picture counts only once the world's depth is done and readable: one written before
             // that is not the lit world (the game writes one then, and the shader could never read the
@@ -1850,6 +1875,17 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
                         n.final_before = b.Transition.StateBefore;
                         n.final_after = b.Transition.StateAfter;
                         n.final_format = f;
+                    }
+                    if (finished && !n.composite && f != DXGI_FORMAT_UNKNOWN && d.Width == s.depth_width && d.Height == s.depth_height &&
+                        d.MipLevels == 1 && d.DepthOrArraySize == 1) {
+                        const std::uint64_t kind = std::uint64_t{static_cast<std::uint32_t>(f)} | (std::uint64_t{static_cast<std::uint32_t>(d.Flags)} << 8) |
+                                                   ((b.Transition.StateBefore & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ? (std::uint64_t{1} << 40) : 0);
+                        if (!s.locked || kind == s.locked) {
+                            n.last_picture = resource;
+                            n.last_after = b.Transition.StateAfter;
+                            n.last_format = f;
+                            ++n.finished_count;
+                        }
                     }
                 }
             }
