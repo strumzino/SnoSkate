@@ -87,6 +87,9 @@ constexpr UINT64 measure_slice = UINT64{measure_pitch};
 // Command allocators: the depth's copy and the shader each take one a frame, and the GPU runs frames
 // behind; with eight a frame now and then found none free and went without the snow (2026-11-11).
 constexpr std::size_t allocator_count = 16;
+// The draws inside the game's own lists (draw_inside): each its own part of the upload buffer and its own views, after
+// the allocators'. Four: the GPU is done with one by the time it comes round again.
+constexpr std::size_t inside_ring = 4;
 // A smaller screen-shaped depth takes the world's place only once the one known has been missed this many presents
 // (a render scale below 100%, a smaller screen). At 30, the game's half-size depth (960x540 at 1080p) took over for a
 // moment as the time of day's shadow and sky caches came back on (the full one is made anew then), and the near
@@ -176,6 +179,7 @@ struct Notes {
     ID3D12Resource* final_picture{};
     D3D12_RESOURCE_STATES final_before{}, final_after{};
     DXGI_FORMAT final_format{};
+    bool drawn_inside{}; // the plugin's shader was drawn on this list itself (draw_inside)
 };
 struct Shared {
     std::mutex mutex;
@@ -253,6 +257,9 @@ struct Shared {
     unsigned budget_frames{};
     // The heights' and the data's versions in each allocator's part of the upload buffer: copied only when they changed.
     std::array<std::uint64_t, allocator_count> heights_uploaded{}, data_uploaded{};
+    std::array<std::uint64_t, inside_ring> inside_heights_uploaded{}, inside_data_uploaded{};
+    std::size_t inside_next{};
+    std::uint64_t inside_frame{~std::uint64_t{0}}; // the frame last drawn inside a game's list
     bool relearning{}; // a new camera: the next middle measured is taken, up or down
     // The cameras of this and the last two frames, newest first, and how many are known.
     std::array<std::array<float, camera_floats>, camera_history> cameras{};
@@ -319,6 +326,9 @@ std::atomic<ID3D12Resource*> colour_now{};
 std::atomic<bool> active{}; // wanted, and installed
 // The table of the runtime's command queues (the overlay's own queue's), where ensure_hooks puts its hook.
 std::atomic<void**> queue_table{};
+// And of its graphics command lists (the overlay's own list's), where the hooks that follow the game's lists go.
+std::atomic<void**> list_table{};
+std::atomic<bool> lists_followed{}; // all of those are in place
 // Our own command list: its barriers go through the same hook as the game's and are not the game's.
 std::atomic<ID3D12GraphicsCommandList*> our_list{};
 
@@ -357,6 +367,15 @@ void STDMETHODCALLTYPE hooked_execute(ID3D12CommandQueue* queue, UINT count, ID3
         // almost a whole frame in one command list, so this is the first place after the scene is done
         // (traced 2026-11-10: the screen PRESENT to render target, the 1920x1080 R11G11B10 scene and the
         // RGBA8 UI layer read, the screen back to PRESENT, all in one batch of one list).
+        // A list of the batch the shader was drawn on itself (draw_inside): this frame has it.
+        for (UINT i = 0; i < count && !s.drawn; ++i) {
+            const auto found = s.notes.find(static_cast<ID3D12GraphicsCommandList*>(lists[i]));
+            if (found == s.notes.end() || !found->second.drawn_inside) continue;
+            s.drawn = true;
+            s.tried = true;
+            s.why = nullptr;
+            ++s.outcomes["drawn inside the game's list"];
+        }
         const Notes* composite{};
         bool to_screen = false; // a list of the batch takes the screen to a render target
         for (UINT i = 0; i < count && !composite; ++i) {
@@ -690,7 +709,7 @@ bool build_list(Shared& s) {
         upload.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bytes{};
         bytes.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bytes.Width = upload_slice * s.allocators.size();
+        bytes.Width = upload_slice * (s.allocators.size() + inside_ring);
         bytes.Height = 1;
         bytes.DepthOrArraySize = 1;
         bytes.MipLevels = 1;
@@ -706,11 +725,11 @@ bool build_list(Shared& s) {
         s.upload_cpu = static_cast<std::uint8_t*>(cpu);
         D3D12_DESCRIPTOR_HEAP_DESC views{};
         views.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        views.NumDescriptors = views_each * static_cast<UINT>(s.allocators.size());
+        views.NumDescriptors = views_each * static_cast<UINT>(s.allocators.size() + inside_ring);
         views.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         D3D12_DESCRIPTOR_HEAP_DESC targets{};
         targets.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        targets.NumDescriptors = 5; // the picture, (1, 2 free), our depth copy, the measurements
+        targets.NumDescriptors = 5; // the picture, the picture drawn inside a game's list, (2 free), our depth copy, the measurements
         if (FAILED(s.device->CreateDescriptorHeap(&views, IID_PPV_ARGS(&s.views))) || FAILED(s.device->CreateDescriptorHeap(&targets, IID_PPV_ARGS(&s.targets)))) {
             say_failed("no descriptor heaps.");
             return false;
@@ -969,6 +988,91 @@ void take_measurements(Shared& s, const std::uint8_t* rows) {
 }
 
 // Records our list: the picture copied, then drawn back through the plugin's shader. Under the lock.
+// The camera the picture was drawn with (camera_delay), this frame's taken into the history first: between the two kept
+// either side of it, blended (its axes made unit again); the oldest kept, until there are enough.
+std::array<float, camera_floats> picture_camera(Shared& s, const plugin_camera::Projector& projector) {
+    {
+        const auto& m = projector.m;
+        for (std::size_t c = camera_history - 1; c > 0; --c) s.cameras[c] = s.cameras[c - 1];
+        s.cameras[0] = {m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10], m[12], m[13], m[14]};
+        s.cameras_known = std::min(s.cameras_known + 1, camera_history);
+    }
+    const float back = std::min(camera_delay, static_cast<float>(s.cameras_known - 1));
+    const auto delay = static_cast<std::size_t>(back);
+    const std::size_t older = std::min(delay + 1, s.cameras_known - 1);
+    const float blend = back - static_cast<float>(delay);
+    std::array<float, camera_floats> camera{};
+    for (std::size_t k = 0; k < camera_floats; ++k) camera[k] = s.cameras[delay][k] + (s.cameras[older][k] - s.cameras[delay][k]) * blend;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        float* const v = camera.data() + axis * 3;
+        const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (length > 1e-6f) v[0] /= length, v[1] /= length, v[2] /= length;
+    }
+    return camera;
+}
+
+// A part of an upload buffer for one draw of the plugin's shader: the cbuffer, and the plugin's data and the heights where
+// they changed since they last went into that part (a part never written holds whatever the buffer had, so each is
+// written once at least). Under both locks.
+void fill_slice(Shared& s, Asked& a, std::uint8_t* slice, std::uint64_t& data_uploaded, std::uint64_t& heights_uploaded,
+                const std::array<float, camera_floats>& camera, float focal, float width, float height, bool have_last) {
+    const std::uint64_t now = GetTickCount64();
+    const bool anchored = a.anchor && now < a.anchor_until;
+    const std::size_t data_floats4 = a.data ? std::min(a.data->size(), most_data_bytes) / 16 : 0;
+    if (a.data && data_uploaded != a.data_version + 1) {
+        data_uploaded = a.data_version + 1;
+        std::memcpy(slice + data_offset, a.data->data(), data_floats4 * 16);
+    }
+    if (a.heights) {
+        float* const head = reinterpret_cast<float*>(slice + heights_offset);
+        head[0] = 1.0f;
+        head[1] = static_cast<float>(height_grids[0].cells), head[2] = height_grids[0].size, head[3] = static_cast<float>(height_grids[1].cells);
+        head[4] = height_grids[1].size, head[5] = static_cast<float>(a.heights_near_first[0]), head[6] = static_cast<float>(a.heights_near_first[1]);
+        head[7] = 0;
+        if (heights_uploaded != a.heights_version + 1) {
+            heights_uploaded = a.heights_version + 1;
+            float* to = head + 8;
+            std::memcpy(to, a.heights_cells[0].data(), a.heights_cells[0].size() * sizeof(a.heights_cells[0][0]));
+            to += a.heights_cells[0].size() * 4;
+            std::memcpy(to, a.heights_cells[1].data(), a.heights_cells[1].size() * sizeof(a.heights_cells[1][0]));
+            to += a.heights_cells[1].size() * 4;
+            std::memcpy(to, a.heights_near_top.data(), a.heights_near_top.size() * sizeof(float));
+        }
+    } else {
+        reinterpret_cast<float*>(slice + heights_offset)[0] = 0.0f;
+    }
+    a.eye = {camera[9], camera[10], camera[11]};
+    a.eye_known = true;
+    // A change of the distance held slides over half a second instead of jumping.
+    if (s.held_near <= 0 || s.shown_near <= 0 || now < s.shown_near_at) {
+        s.shown_near = s.held_near;
+    } else {
+        const float step = std::min(static_cast<float>(now - s.shown_near_at) / 150.0f, 1.0f);
+        s.shown_near += (s.held_near - s.shown_near) * step;
+        if (std::abs(s.shown_near - s.held_near) < s.held_near * 1e-4f) s.shown_near = s.held_near;
+    }
+    s.shown_near_at = now;
+    const double seconds = static_cast<double>(now_us()) / 1e6;
+    const float frame_seconds = static_cast<float>(std::clamp(seconds - s.last_seconds, 0.0, 0.25));
+    s.last_seconds = seconds;
+    const auto& m = camera; // right, up, back, eye: three a row
+    const auto& l = s.last_camera;
+    std::array<float, cbuffer_floats> constants{
+        m[0], m[1], m[2], focal,
+        m[3], m[4], m[5], width,
+        m[6], m[7], m[8], height,
+        m[9], m[10], m[11], s.shown_near, // the near distance measured (0: not yet)
+        l[0], l[1], l[2], have_last ? 1.0f : 0.0f,
+        l[3], l[4], l[5], 0,
+        l[6], l[7], l[8], 0,
+        l[9], l[10], l[11], 0,
+        anchored ? (*a.anchor)[0] : 0.0f, anchored ? (*a.anchor)[1] : 0.0f, anchored ? (*a.anchor)[2] : 0.0f, anchored ? 1.0f : 0.0f,
+        static_cast<float>(clock_seconds()), frame_seconds, static_cast<float>(data_floats4), a.heights ? 1.0f : 0.0f};
+    for (std::size_t i = 0; i < value_count; ++i) constants[40 + i] = a.values[i];
+    std::memcpy(slice, constants.data(), sizeof(constants));
+    s.last_camera = camera;
+}
+
 bool record_shader(Shared& s) {
     s.why = "nothing to draw into";
     if (s.failed || !s.colour || !s.main_depth) return false;
@@ -1064,26 +1168,7 @@ bool record_shader(Shared& s) {
     if (FAILED(s.allocators[at]->Reset()) || FAILED(s.list->Reset(s.allocators[at].Get(), nullptr))) return false;
     s.list->EndQuery(s.timer_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(at * 2));
     s.next_allocator = (at + 1) % s.allocators.size();
-    // This frame's camera, newest first.
-    {
-        const auto& m = projector->m;
-        for (std::size_t c = camera_history - 1; c > 0; --c) s.cameras[c] = s.cameras[c - 1];
-        s.cameras[0] = {m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10], m[12], m[13], m[14]};
-        s.cameras_known = std::min(s.cameras_known + 1, camera_history);
-    }
-    // The camera the picture was drawn with (camera_delay): between the two kept either side of it, blended (its axes
-    // made unit again); the oldest kept, until there are enough.
-    const float back = std::min(camera_delay, static_cast<float>(s.cameras_known - 1));
-    const auto delay = static_cast<std::size_t>(back);
-    const std::size_t older = std::min(delay + 1, s.cameras_known - 1);
-    const float blend = back - static_cast<float>(delay);
-    std::array<float, camera_floats> camera{};
-    for (std::size_t k = 0; k < camera_floats; ++k) camera[k] = s.cameras[delay][k] + (s.cameras[older][k] - s.cameras[delay][k]) * blend;
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        float* const v = camera.data() + axis * 3;
-        const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-        if (length > 1e-6f) v[0] /= length, v[1] /= length, v[2] /= length;
-    }
+    const auto camera = picture_camera(s, *projector);
     if (++s.cost_frames >= 600) {
         s.cost_frames = 0;
         // What it costs: on the GPU a frame, and the heights' rays on the game's update thread a tick.
@@ -1100,34 +1185,8 @@ bool record_shader(Shared& s) {
     }
     const std::uint64_t now = GetTickCount64();
     const bool anchored = a.anchor && now < a.anchor_until;
-    // This allocator's part of the upload buffer: the plugin's data and the heights where they changed since it last
-    // went into this part (a part never written holds whatever the buffer had, so each is written once at least).
+    // This allocator's part of the upload buffer.
     std::uint8_t* const slice = s.upload_cpu + at * upload_slice;
-    const std::size_t data_floats4 = a.data ? std::min(a.data->size(), most_data_bytes) / 16 : 0;
-    if (a.data && s.data_uploaded[at] != a.data_version + 1) {
-        s.data_uploaded[at] = a.data_version + 1;
-        std::memcpy(slice + data_offset, a.data->data(), data_floats4 * 16);
-    }
-    if (a.heights) {
-        float* const head = reinterpret_cast<float*>(slice + heights_offset);
-        head[0] = 1.0f;
-        head[1] = static_cast<float>(height_grids[0].cells), head[2] = height_grids[0].size, head[3] = static_cast<float>(height_grids[1].cells);
-        head[4] = height_grids[1].size, head[5] = static_cast<float>(a.heights_near_first[0]), head[6] = static_cast<float>(a.heights_near_first[1]);
-        head[7] = 0;
-        if (s.heights_uploaded[at] != a.heights_version + 1) {
-            s.heights_uploaded[at] = a.heights_version + 1;
-            float* to = head + 8;
-            std::memcpy(to, a.heights_cells[0].data(), a.heights_cells[0].size() * sizeof(a.heights_cells[0][0]));
-            to += a.heights_cells[0].size() * 4;
-            std::memcpy(to, a.heights_cells[1].data(), a.heights_cells[1].size() * sizeof(a.heights_cells[1][0]));
-            to += a.heights_cells[1].size() * 4;
-            std::memcpy(to, a.heights_near_top.data(), a.heights_near_top.size() * sizeof(float));
-        }
-    } else {
-        reinterpret_cast<float*>(slice + heights_offset)[0] = 0.0f;
-    }
-    a.eye = {camera[9], camera[10], camera[11]};
-    a.eye_known = true;
     // Views: the picture's copy as the target's format reads it, and our copy of the depth.
     const UINT view_step = s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     auto view = s.views->GetCPUDescriptorHandleForHeapStart();
@@ -1162,35 +1221,8 @@ bool record_shader(Shared& s) {
     transition(list, s.picture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     transition(list, s.colour, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-    // A change of the distance held slides over half a second instead of jumping.
-    if (s.held_near <= 0 || s.shown_near <= 0 || now < s.shown_near_at) {
-        s.shown_near = s.held_near;
-    } else {
-        const float step = std::min(static_cast<float>(now - s.shown_near_at) / 150.0f, 1.0f);
-        s.shown_near += (s.held_near - s.shown_near) * step;
-        if (std::abs(s.shown_near - s.held_near) < s.held_near * 1e-4f) s.shown_near = s.held_near;
-    }
-    s.shown_near_at = now;
-    const double seconds = static_cast<double>(now_us()) / 1e6;
-    const float frame_seconds = static_cast<float>(std::clamp(seconds - s.last_seconds, 0.0, 0.25));
-    s.last_seconds = seconds;
-    const auto& m = camera; // right, up, back, eye: three a row
-    const auto& l = s.last_camera;
     const float width = static_cast<float>(colour_desc.Width), height = static_cast<float>(colour_desc.Height);
-    std::array<float, cbuffer_floats> constants{
-        m[0], m[1], m[2], projector->focal,
-        m[3], m[4], m[5], width,
-        m[6], m[7], m[8], height,
-        m[9], m[10], m[11], s.shown_near, // the near distance measured (0: not yet)
-        l[0], l[1], l[2], have_last ? 1.0f : 0.0f,
-        l[3], l[4], l[5], 0,
-        l[6], l[7], l[8], 0,
-        l[9], l[10], l[11], 0,
-        anchored ? (*a.anchor)[0] : 0.0f, anchored ? (*a.anchor)[1] : 0.0f, anchored ? (*a.anchor)[2] : 0.0f, anchored ? 1.0f : 0.0f,
-        static_cast<float>(clock_seconds()), frame_seconds, static_cast<float>(data_floats4), a.heights ? 1.0f : 0.0f};
-    for (std::size_t i = 0; i < value_count; ++i) constants[40 + i] = a.values[i];
-    std::memcpy(slice, constants.data(), sizeof(constants));
-    s.last_camera = camera;
+    fill_slice(s, a, slice, s.data_uploaded[at], s.heights_uploaded[at], camera, projector->focal, width, height, have_last);
     const auto upload = s.upload->GetGPUVirtualAddress() + at * upload_slice;
     ID3D12DescriptorHeap* heaps[] = {s.views.Get()};
     list->SetDescriptorHeaps(1, heaps);
@@ -1256,6 +1288,346 @@ bool record_shader(Shared& s) {
     return true;
 }
 
+// ---- drawn inside the game's own list, on the frames there is no other moment ------------------------------------
+// On some frames the game finishes the world's picture and post-processes it in one batch, before the batch that takes
+// the screen to a render target: there is no moment between batches before the picture is used, and the shader went
+// without that frame (a blink, about one frame in 6,000, 2026-11-16). On those frames it is drawn inside that list, just
+// before the game's own barrier that finishes the picture, and the list is left as the game had it: what the game set on
+// its graphics lists (pipeline, root signature and arguments, descriptor heaps, viewports, scissors, render targets,
+// topology) is followed while a world shader is on, from each list's Reset, and put back after the draw. A list whose
+// state is not all known (reset before the following began, or one that ran a bundle) is never drawn into.
+// Slots of ID3D12GraphicsCommandList's table (d3d12.h's declaration order).
+constexpr std::size_t list_reset = 10, list_clear_state = 11, list_topology = 20, list_viewports = 21, list_scissors = 22, list_pipeline = 25,
+                      list_bundle = 27, list_heaps = 28, list_root_signature = 30, list_table_slot = 32, list_constant = 34, list_constants = 36,
+                      list_cbv = 38, list_srv = 40, list_uav = 42, list_targets = 46;
+
+struct RootArg {
+    std::uint8_t kind{}; // 0 none, 1 a table, 2 constants, 3 a constant buffer, 4 a shader resource, 5 an unordered access
+    std::uint64_t value{};
+    std::vector<UINT> constants;
+};
+struct ListState {
+    bool complete{};
+    std::uint64_t reset{}; // which Reset of the list this follows (list_resets)
+    ID3D12PipelineState* pipeline{};
+    UINT heap_count{};
+    std::array<ID3D12DescriptorHeap*, 2> heaps{};
+    ID3D12RootSignature* root{};
+    std::vector<RootArg> args;
+    bool has_topology{};
+    D3D12_PRIMITIVE_TOPOLOGY topology{};
+    UINT viewport_count{};
+    std::array<D3D12_VIEWPORT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports{};
+    UINT scissor_count{};
+    std::array<D3D12_RECT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> scissors{};
+    bool has_targets{};
+    UINT target_count{};
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> targets{};
+    BOOL single{};
+    bool has_depth{};
+    D3D12_CPU_DESCRIPTOR_HANDLE depth{};
+};
+std::atomic<bool> tracking{}; // a world shader is on: the game's lists are followed
+// Each recording thread's lists (a list is recorded on one thread from its Reset to its Close; one that moves to another
+// thread has no known state there).
+thread_local std::unordered_map<ID3D12GraphicsCommandList*, ListState> list_states;
+thread_local bool drawing_inside{}; // our own calls on a game's list: not the game's state
+// Each list's latest Reset, on whatever thread: what a thread followed of a list since reset on another is not its state.
+std::mutex list_resets_mutex;
+std::unordered_map<ID3D12GraphicsCommandList*, std::uint64_t> list_resets;
+std::uint64_t list_resets_count{};
+std::uint64_t note_reset(ID3D12GraphicsCommandList* list) {
+    std::lock_guard lock(list_resets_mutex);
+    return list_resets[list] = ++list_resets_count;
+}
+bool latest_reset(ID3D12GraphicsCommandList* list, std::uint64_t reset) {
+    std::lock_guard lock(list_resets_mutex);
+    const auto found = list_resets.find(list);
+    return found != list_resets.end() && found->second == reset;
+}
+ListState& state_of(ID3D12GraphicsCommandList* list) { return list_states[list]; }
+bool following() { return tracking.load(std::memory_order_relaxed) && !drawing_inside; }
+RootArg& arg_of(ListState& st, UINT index) {
+    if (st.args.size() <= index) st.args.resize(index + 1);
+    return st.args[index];
+}
+
+using ResetFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+using ClearStateFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+using TopologyFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_PRIMITIVE_TOPOLOGY);
+using ViewportsFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*);
+using ScissorsFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*);
+using PipelineFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+using BundleFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12GraphicsCommandList*);
+using HeapsFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*);
+using RootSignatureFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
+using TableFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+using ConstantFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+using ConstantsFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT);
+using AddressFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
+using TargetsFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+std::atomic<ResetFn> original_reset{};
+std::atomic<ClearStateFn> original_clear_state{};
+std::atomic<TopologyFn> original_topology{};
+std::atomic<ViewportsFn> original_viewports{};
+std::atomic<ScissorsFn> original_scissors{};
+std::atomic<PipelineFn> original_pipeline{};
+std::atomic<BundleFn> original_bundle{};
+std::atomic<HeapsFn> original_heaps{};
+std::atomic<RootSignatureFn> original_root_signature{};
+std::atomic<TableFn> original_table{};
+std::atomic<ConstantFn> original_constant{};
+std::atomic<ConstantsFn> original_constants{};
+std::atomic<AddressFn> original_cbv{}, original_srv{}, original_uav{};
+std::atomic<TargetsFn> original_targets{};
+
+HRESULT STDMETHODCALLTYPE hooked_reset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pipeline) {
+    const HRESULT result = original_reset.load()(list, allocator, pipeline);
+    if (following()) {
+        auto& st = state_of(list);
+        st = ListState{};
+        st.complete = SUCCEEDED(result);
+        st.reset = note_reset(list);
+        st.pipeline = pipeline;
+    } else if (!drawing_inside) {
+        list_states.erase(list);
+        if (tracking.load(std::memory_order_relaxed)) (void)note_reset(list);
+    }
+    return result;
+}
+void STDMETHODCALLTYPE hooked_clear_state(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline) {
+    original_clear_state.load()(list, pipeline);
+    if (following()) {
+        auto& st = state_of(list);
+        const bool complete = st.complete;
+        st = ListState{};
+        st.complete = complete;
+        st.pipeline = pipeline;
+    }
+}
+void STDMETHODCALLTYPE hooked_topology(ID3D12GraphicsCommandList* list, D3D12_PRIMITIVE_TOPOLOGY topology) {
+    original_topology.load()(list, topology);
+    if (following()) {
+        auto& st = state_of(list);
+        st.has_topology = true;
+        st.topology = topology;
+    }
+}
+void STDMETHODCALLTYPE hooked_viewports(ID3D12GraphicsCommandList* list, UINT count, const D3D12_VIEWPORT* viewports) {
+    original_viewports.load()(list, count, viewports);
+    if (following()) {
+        auto& st = state_of(list);
+        st.viewport_count = std::min<UINT>(count, static_cast<UINT>(st.viewports.size()));
+        if (viewports) std::copy_n(viewports, st.viewport_count, st.viewports.begin());
+    }
+}
+void STDMETHODCALLTYPE hooked_scissors(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RECT* rects) {
+    original_scissors.load()(list, count, rects);
+    if (following()) {
+        auto& st = state_of(list);
+        st.scissor_count = std::min<UINT>(count, static_cast<UINT>(st.scissors.size()));
+        if (rects) std::copy_n(rects, st.scissor_count, st.scissors.begin());
+    }
+}
+void STDMETHODCALLTYPE hooked_pipeline(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline) {
+    original_pipeline.load()(list, pipeline);
+    if (following()) state_of(list).pipeline = pipeline;
+}
+void STDMETHODCALLTYPE hooked_bundle(ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList* bundle) {
+    original_bundle.load()(list, bundle);
+    if (following()) state_of(list).complete = false; // what the bundle set is not known
+}
+void STDMETHODCALLTYPE hooked_heaps(ID3D12GraphicsCommandList* list, UINT count, ID3D12DescriptorHeap* const* heaps) {
+    original_heaps.load()(list, count, heaps);
+    if (following()) {
+        auto& st = state_of(list);
+        st.heap_count = std::min<UINT>(count, 2);
+        for (UINT i = 0; i < st.heap_count; ++i) st.heaps[i] = heaps ? heaps[i] : nullptr;
+    }
+}
+void STDMETHODCALLTYPE hooked_root_signature(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root) {
+    original_root_signature.load()(list, root);
+    if (following()) {
+        auto& st = state_of(list);
+        if (st.root != root) st.args.clear(); // another root signature: its arguments are set afresh
+        st.root = root;
+    }
+}
+void STDMETHODCALLTYPE hooked_table(ID3D12GraphicsCommandList* list, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) {
+    original_table.load()(list, index, table);
+    if (following()) {
+        auto& arg = arg_of(state_of(list), index);
+        arg.kind = 1, arg.value = table.ptr;
+    }
+}
+void STDMETHODCALLTYPE hooked_constant(ID3D12GraphicsCommandList* list, UINT index, UINT value, UINT offset) {
+    original_constant.load()(list, index, value, offset);
+    if (following()) {
+        auto& arg = arg_of(state_of(list), index);
+        if (arg.kind != 2) arg.constants.clear();
+        arg.kind = 2;
+        if (arg.constants.size() <= offset) arg.constants.resize(offset + 1);
+        arg.constants[offset] = value;
+    }
+}
+void STDMETHODCALLTYPE hooked_constants(ID3D12GraphicsCommandList* list, UINT index, UINT count, const void* values, UINT offset) {
+    original_constants.load()(list, index, count, values, offset);
+    if (following()) {
+        auto& arg = arg_of(state_of(list), index);
+        if (arg.kind != 2) arg.constants.clear();
+        arg.kind = 2;
+        if (arg.constants.size() < offset + count) arg.constants.resize(offset + count);
+        if (values) std::memcpy(arg.constants.data() + offset, values, std::size_t{count} * sizeof(UINT));
+    }
+}
+template <std::atomic<AddressFn>& original, std::uint8_t kind>
+void STDMETHODCALLTYPE hooked_address(ID3D12GraphicsCommandList* list, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    original.load()(list, index, address);
+    if (following()) {
+        auto& arg = arg_of(state_of(list), index);
+        arg.kind = kind, arg.value = address;
+    }
+}
+void STDMETHODCALLTYPE hooked_targets(ID3D12GraphicsCommandList* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single,
+                                      const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
+    original_targets.load()(list, count, targets, single, depth);
+    if (following()) {
+        auto& st = state_of(list);
+        st.has_targets = true;
+        st.target_count = std::min<UINT>(count, static_cast<UINT>(st.targets.size()));
+        st.single = single;
+        // One handle and a range from it, or a handle each.
+        const UINT handles = single ? std::min<UINT>(st.target_count, 1) : st.target_count;
+        if (targets) std::copy_n(targets, handles, st.targets.begin());
+        st.has_depth = depth != nullptr;
+        if (depth) st.depth = *depth;
+    }
+}
+
+// The game's state put back on its list, as it had it before our draw (our own calls, so not followed).
+void restore(ID3D12GraphicsCommandList* list, const ListState& st) {
+    if (st.heap_count) list->SetDescriptorHeaps(st.heap_count, st.heaps.data());
+    if (st.pipeline) list->SetPipelineState(st.pipeline);
+    if (st.root) {
+        list->SetGraphicsRootSignature(st.root);
+        for (UINT i = 0; i < st.args.size(); ++i) {
+            const auto& arg = st.args[i];
+            switch (arg.kind) {
+            case 1: list->SetGraphicsRootDescriptorTable(i, D3D12_GPU_DESCRIPTOR_HANDLE{arg.value}); break;
+            case 2:
+                if (!arg.constants.empty()) list->SetGraphicsRoot32BitConstants(i, static_cast<UINT>(arg.constants.size()), arg.constants.data(), 0);
+                break;
+            case 3: list->SetGraphicsRootConstantBufferView(i, arg.value); break;
+            case 4: list->SetGraphicsRootShaderResourceView(i, arg.value); break;
+            case 5: list->SetGraphicsRootUnorderedAccessView(i, arg.value); break;
+            default: break;
+            }
+        }
+    }
+    if (st.has_topology) list->IASetPrimitiveTopology(st.topology);
+    if (st.viewport_count) list->RSSetViewports(st.viewport_count, st.viewports.data());
+    if (st.scissor_count) list->RSSetScissorRects(st.scissor_count, st.scissors.data());
+    if (st.has_targets) list->OMSetRenderTargets(st.target_count, st.target_count ? st.targets.data() : nullptr, st.single, st.has_depth ? &st.depth : nullptr);
+    else list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+}
+
+// The plugin's shader drawn inside a game's list, into `picture` (the world's, of the kind locked onto, in `before`, which
+// the game's own barrier is about to move to being read). Under s's lock, on the game's recording thread. True when drawn.
+bool draw_inside(Shared& s, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, D3D12_RESOURCE_STATES before,
+                 void(STDMETHODCALLTYPE* barrier)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*)) {
+    if (!barrier || !following() || s.failed || !s.device || !s.locked || !s.picture || !s.depth_copy || !s.root || !s.upload_cpu || !s.views ||
+        !s.targets)
+        return false;
+    const auto known = list_states.find(list);
+    if (known == list_states.end() || !known->second.complete || !latest_reset(list, known->second.reset)) return false;
+    if (s.depth_copied_frame > s.frame || s.frame - s.depth_copied_frame > 6) return false;
+    const auto desc = picture->GetDesc();
+    if (desc.Width != s.picture_desc.Width || desc.Height != s.picture_desc.Height || desc.Format != s.picture_desc.Format ||
+        !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+        return false;
+    const float width = static_cast<float>(desc.Width), height = static_cast<float>(desc.Height);
+    const auto projector = plugin_camera::projector(width, height);
+    if (!projector) return false;
+    auto& a = asked();
+    std::lock_guard asked_lock(a.mutex);
+    const auto found = a.programs.find(a.key);
+    if (found == a.programs.end() || found->second->state != Program::State::ready) return false;
+    auto* const pipeline = plugin_pipeline(s, a.key, *found->second, a.name, s.colour_format);
+    if (!pipeline) return false;
+    const std::size_t slot = s.inside_next;
+    s.inside_next = (slot + 1) % inside_ring;
+    const auto camera = picture_camera(s, *projector);
+    const bool have_last = s.last_drawn_frame + 1 == s.frame;
+    const std::size_t part = s.allocators.size() + slot; // the upload buffer's parts after the allocators'
+    std::uint8_t* const slice = s.upload_cpu + part * upload_slice;
+    fill_slice(s, a, slice, s.inside_data_uploaded[slot], s.inside_heights_uploaded[slot], camera, projector->focal, width, height, have_last);
+    // Views: the picture's copy and our copy of the depth, in this draw's own two after the allocators'.
+    const UINT view_step = s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT first_view = views_each * static_cast<UINT>(part);
+    auto view = s.views->GetCPUDescriptorHandleForHeapStart();
+    view.ptr += SIZE_T{view_step} * first_view;
+    D3D12_SHADER_RESOURCE_VIEW_DESC picture_view{};
+    picture_view.Format = s.colour_format;
+    picture_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    picture_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    picture_view.Texture2D.MipLevels = 1;
+    s.device->CreateShaderResourceView(s.picture.Get(), &picture_view, view);
+    view.ptr += view_step;
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_view{};
+    depth_view.Format = depth_copy_format;
+    depth_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depth_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depth_view.Texture2D.MipLevels = 1;
+    s.device->CreateShaderResourceView(s.depth_copy.Get(), &depth_view, view);
+    // The target: the picture (the RTV heap's second slot).
+    D3D12_RENDER_TARGET_VIEW_DESC target_view{};
+    target_view.Format = s.colour_format;
+    target_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    auto target = s.targets->GetCPUDescriptorHandleForHeapStart();
+    target.ptr += SIZE_T{s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+    s.device->CreateRenderTargetView(picture, &target_view, target);
+
+    drawing_inside = true;
+    const auto move = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        if (from == to) return;
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = resource;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = from;
+        b.Transition.StateAfter = to;
+        barrier(list, 1, &b); // straight to the game's list, past the depth tap
+    };
+    move(picture, before, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyResource(s.picture.Get(), picture);
+    move(s.picture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    move(picture, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const auto upload = s.upload->GetGPUVirtualAddress() + part * upload_slice;
+    ID3D12DescriptorHeap* heaps[] = {s.views.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRootSignature(s.root.Get());
+    list->SetPipelineState(pipeline);
+    list->SetGraphicsRootConstantBufferView(0, upload);
+    auto table = s.views->GetGPUDescriptorHandleForHeapStart();
+    table.ptr += UINT64{view_step} * first_view;
+    list->SetGraphicsRootDescriptorTable(1, table);
+    list->SetGraphicsRootShaderResourceView(2, upload + data_offset);
+    list->SetGraphicsRootShaderResourceView(3, upload + heights_offset);
+    const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(desc.Width), static_cast<LONG>(desc.Height)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->DrawInstanced(3, 1, 0, 0);
+    move(picture, D3D12_RESOURCE_STATE_RENDER_TARGET, before);
+    move(s.picture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    restore(list, known->second);
+    drawing_inside = false;
+    s.last_drawn_frame = s.frame;
+    return true;
+}
+
 bool depth_shaped(const D3D12_RESOURCE_DESC& d, std::uint32_t width, std::uint32_t height) {
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || d.SampleDesc.Count != 1 ||
         d.DepthOrArraySize != 1 || !width || !height)
@@ -1308,6 +1680,32 @@ static void ensure_hooks() noexcept {
         {
             HookBatch batch;
             ok = hook(queues, queue_execute, reinterpret_cast<void*>(&hooked_execute), original_execute, "ExecuteCommandLists");
+            // What the game sets on its lists, for a draw inside one (draw_inside). Without all of them it is never drawn
+            // inside one, and the shader goes on as before.
+            if (void** const lists = list_table.load(); ok && lists) {
+                bool all = true;
+                all = hook(lists, list_reset, reinterpret_cast<void*>(&hooked_reset), original_reset, "Reset") && all;
+                all = hook(lists, list_clear_state, reinterpret_cast<void*>(&hooked_clear_state), original_clear_state, "ClearState") && all;
+                all = hook(lists, list_topology, reinterpret_cast<void*>(&hooked_topology), original_topology, "IASetPrimitiveTopology") && all;
+                all = hook(lists, list_viewports, reinterpret_cast<void*>(&hooked_viewports), original_viewports, "RSSetViewports") && all;
+                all = hook(lists, list_scissors, reinterpret_cast<void*>(&hooked_scissors), original_scissors, "RSSetScissorRects") && all;
+                all = hook(lists, list_pipeline, reinterpret_cast<void*>(&hooked_pipeline), original_pipeline, "SetPipelineState") && all;
+                all = hook(lists, list_bundle, reinterpret_cast<void*>(&hooked_bundle), original_bundle, "ExecuteBundle") && all;
+                all = hook(lists, list_heaps, reinterpret_cast<void*>(&hooked_heaps), original_heaps, "SetDescriptorHeaps") && all;
+                all = hook(lists, list_root_signature, reinterpret_cast<void*>(&hooked_root_signature), original_root_signature,
+                           "SetGraphicsRootSignature") && all;
+                all = hook(lists, list_table_slot, reinterpret_cast<void*>(&hooked_table), original_table, "SetGraphicsRootDescriptorTable") && all;
+                all = hook(lists, list_constant, reinterpret_cast<void*>(&hooked_constant), original_constant, "SetGraphicsRoot32BitConstant") && all;
+                all = hook(lists, list_constants, reinterpret_cast<void*>(&hooked_constants), original_constants, "SetGraphicsRoot32BitConstants") && all;
+                all = hook(lists, list_cbv, reinterpret_cast<void*>(&hooked_address<original_cbv, 3>), original_cbv,
+                           "SetGraphicsRootConstantBufferView") && all;
+                all = hook(lists, list_srv, reinterpret_cast<void*>(&hooked_address<original_srv, 4>), original_srv,
+                           "SetGraphicsRootShaderResourceView") && all;
+                all = hook(lists, list_uav, reinterpret_cast<void*>(&hooked_address<original_uav, 5>), original_uav,
+                           "SetGraphicsRootUnorderedAccessView") && all;
+                all = hook(lists, list_targets, reinterpret_cast<void*>(&hooked_targets), original_targets, "OMSetRenderTargets") && all;
+                lists_followed.store(all);
+            }
         }
         if (!ok) say_failed("its D3D12 hooks are not all in place.");
         else logging::write(logging::Level::info, logging::Channel::graphics, "World shader: hooks installed, as a plugin asked for a world shader.");
@@ -1625,6 +2023,7 @@ void install(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsComm
     }
     // Only where the hook would go: it goes in when a plugin first asks for a world shader (ensure_hooks).
     queue_table.store(*reinterpret_cast<void***>(queue));
+    list_table.store(*reinterpret_cast<void***>(list));
     if (wanted.load()) ensure_hooks(); // one asked for before the overlay's graphics were up
 }
 
@@ -1634,6 +2033,7 @@ void present(std::uint32_t width, std::uint32_t height) noexcept {
         std::lock_guard lock(s.mutex);
         const bool ready = original_execute.load() && !s.failed && s.queue && !retired.load();
         active.store(ready && wanted.load() && allowed.load());
+        tracking.store(active.load() && lists_followed.load());
         if (!active.load()) {
             s.active_frames = 0;
             s.notes.clear();
@@ -1754,6 +2154,7 @@ void release() noexcept {
         auto& s = shared();
         std::lock_guard lock(s.mutex);
         active.store(false);
+        tracking.store(false);
         // The overlay waits for the GPU before it tears down; ours went on the same queue.
         our_list.store(nullptr);
         s.list.Reset();
@@ -1796,6 +2197,9 @@ void release() noexcept {
         s.notes.clear();
         s.heights_uploaded = {}; // the next upload buffer is new: the heights and data go into each of its parts again
         s.data_uploaded = {};
+        s.inside_heights_uploaded = {};
+        s.inside_data_uploaded = {};
+        s.inside_frame = ~std::uint64_t{0};
         s.timer_key = {};
         s.budget_key = 0, s.budget_ms = 0, s.budget_frames = 0;
         s.device = nullptr;
@@ -1810,7 +2214,7 @@ void release() noexcept {
         s.failed = false;
     } catch (...) {}
 }
-void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b, BarrierFn /*original*/) noexcept {
+void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b, BarrierFn original) noexcept {
     if (!active.load(std::memory_order_relaxed) || list == our_list.load(std::memory_order_relaxed)) return;
     try {
         auto* const colour = colour_now.load(std::memory_order_relaxed);
@@ -1846,6 +2250,20 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
                         n.final_before = b.Transition.StateBefore;
                         n.final_after = b.Transition.StateAfter;
                         n.final_format = f;
+                        // Finished on a list before the screen's barrier (on this list or any): there may be no moment
+                        // between batches before the game reads it, so the shader is drawn here, on this list, just before
+                        // the game's barrier. Only the kind locked onto, once the world's depth is done, once a frame.
+                        const std::uint64_t kind = std::uint64_t{static_cast<std::uint32_t>(f)} | (std::uint64_t{static_cast<std::uint32_t>(d.Flags)} << 8) |
+                                                   ((b.Transition.StateBefore & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ? (std::uint64_t{1} << 40) : 0);
+                        const auto depth_state = n.depth_state_known ? n.depth_state : s.depth_state;
+                        const bool depth_done = (n.depth_state_known || s.depth_state_known) && (depth_state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) &&
+                                                !(depth_state & D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                        if (!n.composite && !s.drawn && s.inside_frame != s.frame && s.locked && kind == s.locked && depth_done && !s.unsafe &&
+                            !n.unsafe && !s.depth_elsewhere && b.Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES &&
+                            draw_inside(s, list, resource, b.Transition.StateBefore, original)) {
+                            n.drawn_inside = true;
+                            s.inside_frame = s.frame;
+                        }
                     }
                 }
             }
@@ -1911,8 +2329,8 @@ void on_barrier(ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b
                                 static_cast<unsigned>(b.Transition.StateBefore), static_cast<unsigned>(b.Transition.StateAfter));
             return;
         }
-        // The main depth buffer: where it goes, so our list knows whether it can read it as it is. Nothing
-        // is ever recorded on the game's lists (a copy of the depth put on them hung the GPU).
+        // The main depth buffer: where it goes, so our list knows whether it can read it as it is. Its copy is never
+        // recorded on the game's lists (one put on them hung the GPU).
         if (resource == main_depth_now.load(std::memory_order_relaxed)) {
             auto& s = shared();
             std::lock_guard lock(s.mutex);
