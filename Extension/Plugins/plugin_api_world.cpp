@@ -3457,6 +3457,14 @@ struct WorldApi {
         return 0;
     }
     // world.shader_cost(): the plugin's world shader's average time a frame on the GPU (ms), or nil until known.
+    // world.shader_clock(): the world shader's clock (its reskate_clock.x), seconds from 0 again every 1000, to stamp
+    // the plugin's data with (when a mark was made) for its shader to work out how long ago, frame by frame.
+    static int world_shader_clock(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "world.shader", "reskate.world.shader_clock");
+        lua_pushnumber(L, game_of(plugin).world_shader_clock());
+        return 1;
+    }
     static int world_shader_cost(lua_State* L) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "world.shader", "reskate.world.shader_cost");
@@ -3628,7 +3636,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
                                   {"bounds", entities_bounds}});
     add_functions(L, "world", {{"set_time", set_time}, {"set_control", set_control}, {"set_park", set_park}, {"pick", world_pick}, {"probe", world_probe},
                                {"shader", world_shader_set}, {"shader_data", world_shader_data}, {"shader_anchor", world_shader_anchor},
-                               {"shader_cost", world_shader_cost}});
+                               {"shader_cost", world_shader_cost}, {"shader_clock", world_shader_clock}});
     add_functions(L, "travel", {{"locations", locations}, {"levels", levels}, {"go", go}, {"load", load}});
     add_functions(L, "ai", {{"spawn", ai_spawn}, {"clear", ai_clear}, {"count", ai_count}});
     add_functions(L, "session", {{"skaters", skaters}, {"tag", tag}, {"nametags", nametags}, {"joint", session_joint}, {"touch", session_touch},

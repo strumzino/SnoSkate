@@ -1286,6 +1286,7 @@ public:
     }
     void world_shader_anchor(std::string_view plugin, std::optional<Vec3> at) override { world_shader::set_anchor(plugin, at); }
     std::optional<double> world_shader_cost(std::string_view plugin) override { return world_shader::cost_ms(plugin); }
+    double world_shader_clock() override { return world_shader::clock_seconds(); }
     // ---- viewmodel -----------------------------------------------------------------------------------
     std::string viewmodel_load(std::string_view plugin, const std::filesystem::path& file) override {
         if (!viewmodeler_.empty() && viewmodeler_ != plugin) return viewmodeler_ + " has the viewmodel";

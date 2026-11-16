@@ -724,6 +724,7 @@ struct FakeGame final : Game {
         calls.push_back(at ? std::format("world anchor {} {:.1f} {:.1f} {:.1f}", plugin, (*at)[0], (*at)[1], (*at)[2]) : std::format("world anchor {} none", plugin));
     }
     std::optional<double> world_shader_cost(std::string_view) override { return 4.5; }
+    double world_shader_clock() override { return 123.25; }
     std::string screen_look(std::string_view plugin, std::optional<ScreenLook> l) override {
         calls.push_back(l ? std::format("look {} {:.2f} {:.0f} {:.2f} {}{}{}{}{}{}{}{}{}{}{} {:.1f} [{}|{}|{}|{}|{}]", plugin, l->bend, l->fov, l->age, l->bars, l->hood,
                                         l->grade, l->soft, l->scanlines, l->grain, l->dropouts, l->head_switching, l->tracking, l->smear, l->iris, l->rolling,
@@ -4808,6 +4809,7 @@ void plugins_run_a_world_shader() {
         reskate.world.shader_anchor(vector.create(1, 2, 3))
         reskate.world.shader_anchor(nil)
         assert(reskate.world.shader_cost() == 4.5)
+        assert(reskate.world.shader_clock() == 123.25)
         assert(not pcall(reskate.world.shader_data, buffer.create(20)), "whole float4s")
         assert(not pcall(reskate.world.shader_data, buffer.create(65536 + 16)), "at most 64 KB")
         assert(not pcall(reskate.world.shader_data, "not a buffer"), "a buffer")
@@ -4832,10 +4834,11 @@ void plugins_run_a_world_shader() {
     check(!game.called("world data world 20") && !game.called("shaders/vertex.dxil"), "Data and files that are not right never reach the game");
     host.apply({package("sneaky", {{manifest_file, manifest(R"("screen.shader")")}, {"shaders/snow.hlsl", files.at("shaders/snow.hlsl")}, {"plugin/main.lua", R"(
         reskate.log("world " .. tostring(pcall(reskate.world.shader, "shaders/snow.hlsl")) .. " " .. tostring(pcall(reskate.world.shader_data, nil)) .. " " ..
-            tostring(pcall(reskate.world.shader_anchor, nil)) .. " " .. tostring(pcall(reskate.world.shader_cost)))
+            tostring(pcall(reskate.world.shader_anchor, nil)) .. " " .. tostring(pcall(reskate.world.shader_cost)) .. " " ..
+            tostring(pcall(reskate.world.shader_clock)))
     )"}})});
     ticks(host, environment, 1);
-    check(environment.logged("[sneaky] world false false false false"), "world.shader is needed\n" + environment.all());
+    check(environment.logged("[sneaky] world false false false false false"), "world.shader is needed\n" + environment.all());
     check(!game.called("world sneaky") && !game.called("world data sneaky") && !game.called("world anchor sneaky"),
           "Nothing of a plugin without it reaches the game");
 }

@@ -1142,7 +1142,7 @@ bool record_shader(Shared& s) {
         l[6], l[7], l[8], 0,
         l[9], l[10], l[11], 0,
         anchored ? (*a.anchor)[0] : 0.0f, anchored ? (*a.anchor)[1] : 0.0f, anchored ? (*a.anchor)[2] : 0.0f, anchored ? 1.0f : 0.0f,
-        static_cast<float>(std::fmod(seconds, 1000.0)), frame_seconds, static_cast<float>(data_floats4), a.heights ? 1.0f : 0.0f};
+        static_cast<float>(clock_seconds()), frame_seconds, static_cast<float>(data_floats4), a.heights ? 1.0f : 0.0f};
     for (std::size_t i = 0; i < value_count; ++i) constants[40 + i] = a.values[i];
     std::memcpy(slice, constants.data(), sizeof(constants));
     s.last_camera = camera;
@@ -1367,6 +1367,7 @@ void set_anchor(std::string_view owner, std::optional<std::array<float, 3>> at) 
     a.anchor = at;
     a.anchor_until = at ? GetTickCount64() + 300 : 0;
 }
+double clock_seconds() noexcept { return std::fmod(static_cast<double>(now_us()) / 1e6, 1000.0); }
 std::optional<double> cost_ms(std::string_view owner) noexcept {
     auto& a = asked();
     std::lock_guard lock(a.mutex);

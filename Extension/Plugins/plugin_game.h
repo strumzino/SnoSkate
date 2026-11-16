@@ -1129,6 +1129,8 @@ public:
     virtual std::string world_shader_data(std::string_view /*plugin*/, std::shared_ptr<const std::string>) { return unavailable; }
     virtual void world_shader_anchor(std::string_view /*plugin*/, std::optional<Vec3>) {}
     virtual std::optional<double> world_shader_cost(std::string_view /*plugin*/) { return std::nullopt; }
+    // The world shader's clock (its reskate_clock.x): seconds, from 0 again every 1000.
+    virtual double world_shader_clock() { return 0; }
     // A hand slaps the lens, while this plugin has the look.
     virtual std::string screen_slap(std::string_view /*plugin*/) { return unavailable; }
     // The skater bails as from a slam of `force` (0.5 to 3); not in a throwdown. While No Bail protects

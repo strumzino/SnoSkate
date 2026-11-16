@@ -106,6 +106,9 @@ std::string set_data(std::string_view owner, std::shared_ptr<const std::string> 
 // Where the depth's near distance is measured (on screen, at a known place: the skater, standing), for the next 300 ms
 // (set it every tick); none: not measured (the distance measured last is kept).
 void set_anchor(std::string_view owner, std::optional<std::array<float, 3>> at) noexcept;
+// The shader's clock (reskate_clock.x): seconds, from 0 again every 1000, as the frame drawn now has it. A plugin
+// stamps its data with it (when a mark was made, when something began) for its shader to work out how long ago.
+double clock_seconds() noexcept;
 // The owner's shader's average time a frame on the GPU over its last frames (milliseconds), once known.
 std::optional<double> cost_ms(std::string_view owner) noexcept;
 bool on() noexcept;
