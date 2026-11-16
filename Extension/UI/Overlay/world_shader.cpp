@@ -265,7 +265,7 @@ struct Shared {
     // The picture's brightness (reskate_light): the last measured, and eased over about half a second, and when.
     float light_raw{}, light{};
     bool light_known{};
-    float far_light{}; // the far scene's (sky, fog), eased over about 2 s, kept while none is in view
+    float far_light{}; // the open sky's, eased over about 4 s, kept while none is in view
     bool far_known{};
     std::uint64_t light_at_us{};
     // The shader's time on the GPU: a timestamp before and after each allocator's list, read back when it is free,
@@ -632,16 +632,15 @@ float measure_at(float3 target) {
 // the biggest group that agrees.
 float ps_measure(Interpolated input) : SV_Target {
     const uint k = (uint)input.position.x;
-    // Past the near distance's: the picture's brightness, at a grid of 8 by 4 points; a point far off (the sky, or past
-    // 120 m, with the near distance known) given as its brightness made negative, so the CPU can keep the far scene's
-    // apart (the game's fog and sky: the same whichever way the camera looks).
+    // Past the near distance's: the picture's brightness, at a grid of 8 by 4 points; a point on the open sky given as
+    // its brightness made negative, so the CPU can keep the sky's apart (the same whichever way the camera looks). With
+    // everything past 120 m counted too, the mix of sky and fogged buildings changed as the camera turned (2026-11-16).
     if (k >= 32u) {
         const uint g = k - 32u;
         const int2 at = int2((float(g % 8u) + 0.5) / 8.0 * up_width.w, (float(g / 8u) + 0.5) / 4.0 * back_height.w);
         const float lum = dot(picture.Load(int3(at, 0)).rgb, float3(0.2126, 0.7152, 0.0722));
         const float d = depth_at(at);
-        const bool far_off = !(d > 0) || (eye_near.w > 0 && eye_near.w / d > 120.0);
-        return far_off ? -max(lum, 1e-6) : lum;
+        return !(d > 0) ? -max(lum, 1e-6) : lum;
     }
     if (anchor.w < 0.5) return 0;
     // Not with the camera looking steeply down (or up) the column: its points then lie over each other on screen, on the
@@ -1120,9 +1119,9 @@ void take_light(Shared& s, const std::uint8_t* rows) {
     if (!n) return;
     const float raw = std::max(static_cast<float>(sum / n), 1e-5f);
     const std::uint64_t now = now_us();
-    // The far scene's (the game's fog and sky), eased over about 2 s, and kept while none is on the screen (looking at the
-    // ground): so a fog drawn with it stays the same as the camera turns. With the whole picture's, it got lighter and
-    // darker with what was in view (2026-11-16).
+    // The open sky's, eased over about 4 s, and kept while none is on the screen (looking at the ground): so a fog drawn
+    // with it stays the same as the camera turns. With the whole picture's, it got lighter and darker with what was in
+    // view (2026-11-16).
     if (far_n >= 2) {
         const float far_raw = std::max(static_cast<float>(far_sum / far_n), 1e-5f);
         if (!s.far_known) {
@@ -1130,7 +1129,7 @@ void take_light(Shared& s, const std::uint8_t* rows) {
             s.far_known = true;
         } else {
             const float seconds = std::clamp(static_cast<float>(now - s.light_at_us) / 1e6f, 0.0f, 1.0f);
-            s.far_light = std::exp(std::log(s.far_light) + (std::log(far_raw) - std::log(s.far_light)) * std::min(seconds / 2.0f, 1.0f));
+            s.far_light = std::exp(std::log(s.far_light) + (std::log(far_raw) - std::log(s.far_light)) * std::min(seconds / 4.0f, 1.0f));
         }
     }
     if (!s.light_known) {
