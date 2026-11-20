@@ -413,6 +413,11 @@ struct FakeGame final : Game {
     void outfit_board_clear(std::string_view plugin, std::string_view part) override {
         calls.push_back(std::format("board item clear {} {}", plugin, part.empty() ? "all" : part));
     }
+    std::string choose_variant(std::string_view plugin, const std::filesystem::path&, std::string_view variant, VariantApply apply) override {
+        calls.push_back(std::format("variant {} {} {}", plugin, variant,
+                                    apply == VariantApply::reload ? "reload" : apply == VariantApply::without_reload ? "without reload" : "next launch"));
+        return {};
+    }
     std::string outfit_stand_ins(std::string_view plugin, std::optional<StandIns> wanted) override {
         if (!wanted) {
             calls.push_back(std::format("stand-ins {} default", plugin));
@@ -4881,6 +4886,35 @@ void plugins_show_items_on_the_board() {
     check(!game.called("board item sneaky"), "Nothing reached the board without the permission");
 }
 
+// A variant chosen to go in with the level loaded again (as before), without loading it, or only for the next
+// launch; options that are not true or false are refused, and choosing still needs the variants permission.
+void plugins_choose_how_a_variant_goes_in() {
+    TestEnvironment environment;
+    auto& game = environment.fake;
+    Host host(environment, Side::client);
+    host.apply({package("decks", {{manifest_file, manifest(R"("variants")")}, {"plugin/main.lua", R"(
+        assert(reskate.package.choose("wide"))
+        assert(reskate.package.choose("wider", {reload = false}))
+        assert(reskate.package.choose("widest", {now = false}))
+        assert(reskate.package.choose("plain", {now = true, reload = true}))
+        assert(not pcall(reskate.package.choose, "wide", {reload = "no"}), "a flag is true or false")
+        assert(not pcall(reskate.package.choose, "wide", "now"), "options are a table")
+        reskate.log("chosen")
+    )"}})});
+    ticks(host, environment, 1);
+    running(host, "decks", environment);
+    check(environment.logged("[decks] chosen"), "The calls work\n" + environment.all());
+    check(game.called("variant decks wide reload") && game.called("variant decks wider without reload") &&
+              game.called("variant decks widest next launch") && game.called("variant decks plain reload"),
+          "Each choice goes in as asked\n" + environment.all());
+    host.apply({package("sneaky", {{manifest_file, manifest()}, {"plugin/main.lua", R"(
+        reskate.log(tostring(pcall(reskate.package.choose, "wide", {reload = false})))
+    )"}})});
+    ticks(host, environment, 1);
+    check(environment.logged("[sneaky] false"), "variants is needed\n" + environment.all());
+    check(!game.called("variant sneaky"), "Nothing was chosen without the permission");
+}
+
 // Reading a skater's joints, and the physics tuning read and set.
 void plugins_read_joints_and_tune_physics() {
     TestEnvironment environment;
@@ -7328,6 +7362,7 @@ int main() {
         run(plugins_show_a_viewmodel);
         run(plugins_show_a_world_model);
         run(plugins_carry_and_take_a_step_in_the_camera_cycle);
+        run(plugins_choose_how_a_variant_goes_in);
         run(plugins_show_items_on_the_board);
         run(plugins_cover_the_world);
         run(plugins_read_joints_and_tune_physics);

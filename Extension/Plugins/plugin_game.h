@@ -1050,8 +1050,13 @@ public:
     };
     // Empty when the mod declares no variants.
     virtual std::optional<VariantState> variants(std::string_view /*plugin*/, const std::filesystem::path& /*package*/) { return std::nullopt; }
-    // The variant saved as the mod's choice, the mods applied again and the level loaded again with it.
-    virtual std::string choose_variant(std::string_view /*plugin*/, const std::filesystem::path& /*package*/, std::string_view /*variant*/) {
+    // How a chosen variant goes into the game (reskate.package.choose's options): the mods applied again and the
+    // level loaded again with it; applied again without loading the level (what the level already loaded stays as
+    // it was until it is loaded again); or only kept as the choice, for the next launch.
+    enum class VariantApply { reload, without_reload, next_launch };
+    // The variant saved as the mod's choice, and applied as asked.
+    virtual std::string choose_variant(std::string_view /*plugin*/, const std::filesystem::path& /*package*/, std::string_view /*variant*/,
+                                       VariantApply /*apply*/) {
         return unavailable;
     }
     // ---- the skater's physics -----------------------------------------------------------------------

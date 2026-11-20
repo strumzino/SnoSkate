@@ -530,13 +530,29 @@ struct ApiFunctions {
             if (!value->empty()) field_text(L, field, *value);
         return 1;
     }
-    // choose(name): that variant of the plugin's own mod in the game: kept as the choice, the mods
-    // applied again and the level loaded again with it. true, or false and why not.
+    // choose(name, {now = true, reload = true}): that variant of the plugin's own mod in the game: kept as the
+    // choice, the mods applied again and the level loaded again with it. reload = false: applied without loading
+    // the level again (what the level has loaded already stays until it loads again); now = false: only kept, for
+    // the next launch. true, or false and why not.
     static int choose(lua_State* L) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "variants", "reskate.package.choose");
         const std::string name = luaL_checkstring(L, 1);
-        return result(L, game_of(plugin).choose_variant(plugin.id(), plugin.directory(), name));
+        auto apply = Game::VariantApply::reload;
+        if (!lua_isnoneornil(L, 2)) {
+            luaL_checktype(L, 2, LUA_TTABLE);
+            const auto flag = [&](const char* field) {
+                lua_getfield(L, 2, field);
+                const int type = lua_type(L, -1);
+                if (type != LUA_TNIL && type != LUA_TBOOLEAN) luaL_error(L, "a choice's %s is true or false", field);
+                const bool value = type == LUA_TNIL || lua_toboolean(L, -1) != 0;
+                lua_pop(L, 1);
+                return value;
+            };
+            const bool now = flag("now"), reload = flag("reload");
+            apply = !now ? Game::VariantApply::next_launch : reload ? Game::VariantApply::reload : Game::VariantApply::without_reload;
+        }
+        return result(L, game_of(plugin).choose_variant(plugin.id(), plugin.directory(), name, apply));
     }
     static int list(lua_State* L) {
         auto& plugin = plugin_of(L);
